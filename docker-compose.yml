@@ -62,6 +62,7 @@ services:
       - "3000:3000"
     volumes:
       - ./apps/web:/usr/src/app
+      - /usr/src/app/node_modules
     command: ["npm","run","dev"]
 
 volumes:

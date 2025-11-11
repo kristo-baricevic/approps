@@ -1,3 +1,14 @@
 {
-  "cSpell.words": ["pydantic", "tailwindcss"]
+  "cSpell.words": [
+    "asyncpg",
+    "boto",
+    "botocore",
+    "dotenv",
+    "minioadmin",
+    "ossp",
+    "presign",
+    "pydantic",
+    "tailwindcss",
+    "TIMESTAMPTZ"
+  ]
 }
