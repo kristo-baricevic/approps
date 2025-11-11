@@ -1,0 +1,12 @@
+# node / next
+apps/web/.next/
+apps/web/node_modules/
+apps/web/.vercel/
+# python
+apps/api/__pycache__/
+apps/api/.venv/
+# env & local
+.env
+*.env
+# macOS
+.DS_Store
