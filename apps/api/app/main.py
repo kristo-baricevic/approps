@@ -7,7 +7,8 @@ from app.storage import s3, BUCKET, ensure_bucket
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
-from app.parser import download_file_to_tmp, parse_pdf_to_rows, md5_row
+from app.parser import download_file_to_tmp, parse_pdf_to_rows_combined, parse_pdf_to_rows, md5_row
+import re
 
 load_dotenv()
 
@@ -64,6 +65,20 @@ async def ensure_tables():
           page INT,
           checksum TEXT
         );
+        -- One-time cleanup is safe to keep; it’s a no-op when already clean.
+        WITH d AS (
+          SELECT ctid,
+                 ROW_NUMBER() OVER (PARTITION BY table_id, checksum ORDER BY ctid) AS rn
+          FROM rows
+          WHERE checksum IS NOT NULL
+        )
+        DELETE FROM rows r
+        USING d
+        WHERE r.ctid = d.ctid
+          AND d.rn > 1;
+
+        CREATE UNIQUE INDEX IF NOT EXISTS rows_table_id_checksum_uniq
+        ON rows(table_id, checksum);
         """)
 
 
@@ -133,10 +148,24 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
 
         tmp = download_file_to_tmp(frow["stored_url"])
         try:
-            rows = parse_pdf_to_rows(tmp)
+            rows = parse_pdf_to_rows_combined(tmp)
         finally:
             try: os.remove(tmp)
             except: pass
+
+        clean_rows = []
+        for r in rows:
+            name = r["program_name"]
+            if len(name) < 4: 
+                continue
+            # must contain at least 2 alphabetic tokens (avoid “a total d”, “o”, “•”)
+            if len([t for t in re.findall(r"[A-Za-z]+", name) if len(t) >= 2]) < 2:
+                continue
+            if r["amount"] is None:
+                continue
+            clean_rows.append(r)
+
+        rows = clean_rows
 
         for r in rows:
             checksum = md5_row(r["program_name"], r["fy"], r["amount"], r["page"])
@@ -144,9 +173,11 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
             bbox_json = json.dumps(bbox_val) if bbox_val else None
             await db.execute(
                 """INSERT INTO rows (table_id, program_id, program_name, fy, amount, bbox, page, checksum)
-                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8)""",
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                ON CONFLICT (table_id, checksum) DO NOTHING""",
                 table_id, None, r["program_name"], r["fy"], r["amount"], bbox_json, r["page"], checksum
             )
+
 
         return {"table_id": str(table_id), "audit": {"passed": True, "messages": []}, "count": len(rows)}
 
@@ -160,10 +191,15 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
 @app.get("/tables/{table_id}/preview")
 async def preview_rows(table_id: str, db=Depends(get_db)):
     rows = await db.fetch(
-        """SELECT program_name, fy, amount, page FROM rows
-           WHERE table_id=$1::uuid
-           ORDER BY page, program_name
-           LIMIT 10""",
+        """-- replace SELECT in /tables/{table_id}/preview
+            SELECT program_name, fy, amount, page
+            FROM rows
+            WHERE table_id = $1::uuid
+            AND length(trim(program_name)) >= 3
+            AND program_name !~ '^[\W•.\-–—\s]+$'
+            AND amount >= 1000
+            ORDER BY page, program_name
+            LIMIT 10;""",
         table_id
     )
     return [dict(r) for r in rows]
