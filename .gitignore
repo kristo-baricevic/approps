@@ -10,3 +10,4 @@ apps/api/.venv/
 *.env
 # macOS
 .DS_Store
+README

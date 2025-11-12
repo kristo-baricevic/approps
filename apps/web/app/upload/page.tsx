@@ -1,4 +1,5 @@
 "use client";
+import { useRouter } from "next/navigation";
 import { useState } from "react";
 
 const API = process.env.NEXT_PUBLIC_API_URL as string;
@@ -50,10 +51,21 @@ async function register(sha256: string, file: File, key: string) {
   return r.json();
 }
 
+async function parseFile(fileId: string, tableLabel: string) {
+  const r = await fetch(`${API}/parse`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ file_id: fileId, table_label: tableLabel }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
 export default function UploadPage() {
   const [a, setA] = useState<File | null>(null);
   const [b, setB] = useState<File | null>(null);
   const [result, setResult] = useState<any>(null);
+  const router = useRouter();
 
   async function handle(file: File) {
     console.log("handle");
@@ -75,6 +87,12 @@ export default function UploadPage() {
     const last = await handle(a);
     const curr = await handle(b);
     setResult({ last, curr });
+
+    const lastParse = await parseFile(last.file_id, "Labor-HHS-Education");
+    const currParse = await parseFile(curr.file_id, "Labor-HHS-Education");
+
+    // go review the Current audit first
+    // router.push(`/audit/${currParse.table_id}`);
   }
 
   return (

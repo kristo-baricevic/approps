@@ -8,6 +8,7 @@ from app.storage import s3, BUCKET, ensure_bucket
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
+from app.parser import download_file_to_tmp, parse_pdf_to_rows, md5_row
 
 load_dotenv()
 
@@ -31,6 +32,7 @@ async def ensure_tables():
     async with pg_pool.acquire() as conn:
         await conn.execute("""
         CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
+
         CREATE TABLE IF NOT EXISTS files (
           id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
           name TEXT NOT NULL,
@@ -40,7 +42,30 @@ async def ensure_tables():
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
         CREATE UNIQUE INDEX IF NOT EXISTS files_sha256_idx ON files(sha256);
+
+        CREATE TABLE IF NOT EXISTS tables (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          file_id UUID NOT NULL REFERENCES files(id) ON DELETE CASCADE,
+          label TEXT NOT NULL,
+          page_start INT,
+          page_end INT,
+          parser_version TEXT,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS rows (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          table_id UUID NOT NULL REFERENCES tables(id) ON DELETE CASCADE,
+          program_id TEXT,
+          program_name TEXT,
+          fy INT,
+          amount BIGINT,
+          bbox JSONB,
+          page INT,
+          checksum TEXT
+        );
         """)
+
 
 async def get_db() -> asyncpg.Connection:
     async with pg_pool.acquire() as conn:
@@ -94,6 +119,48 @@ async def register_endpoint(body: RegisterIn, db: asyncpg.Connection = Depends(g
         )
     return {"file_id": str(row["id"]), "sha256": body.sha256, "stored_url": stored_url}
 
+class ParseIn(BaseModel):
+    file_id: str
+    table_label: str
+
+@app.post("/parse")
+async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
+    # fetch file
+    frow = await db.fetchrow("SELECT id, stored_url FROM files WHERE id=$1::uuid", body.file_id)
+    if not frow:
+        raise HTTPException(404, "file not found")
+
+    # insert tables row
+    trow = await db.fetchrow(
+        """INSERT INTO tables (file_id, label, parser_version)
+           VALUES ($1,$2,$3) RETURNING id""",
+        frow["id"], body.table_label, "v0.1"
+    )
+    table_id = trow["id"]
+
+    # download + parse
+    tmp = download_file_to_tmp(frow["stored_url"])
+    try:
+        rows = parse_pdf_to_rows(tmp)
+    finally:
+        try: os.remove(tmp)
+        except: pass
+
+    # bulk insert rows
+    for r in rows:
+        checksum = md5_row(r["program_name"], r["fy"], r["amount"], r["page"])
+        await db.execute(
+            """INSERT INTO rows (table_id, program_id, program_name, fy, amount, bbox, page, checksum)
+               VALUES ($1,$2,$3,$4,$5,$6,$7,$8)""",
+            table_id, None, r["program_name"], r["fy"], r["amount"], r["bbox"], r["page"], checksum
+        )
+
+    # minimal audit stub for Day-3
+    audit = {"passed": True, "messages": []}
+
+    return {"table_id": str(table_id), "audit": {"passed": True, "messages": []}, "count": len(rows)}
+
+
 
 @app.post("/upload")
 async def upload(file: UploadFile = F(...), db: asyncpg.Connection = Depends(get_db)):
@@ -146,6 +213,16 @@ async def upload(file: UploadFile = F(...), db: asyncpg.Connection = Depends(get
 
     return JSONResponse({"file_id": file_id, "sha256": sha, "stored_url": stored_url})
 
+@app.get("/tables/{table_id}/preview")
+async def preview_rows(table_id: str, db=Depends(get_db)):
+    rows = await db.fetch(
+        """SELECT program_name, fy, amount, page FROM rows
+           WHERE table_id=$1::uuid
+           ORDER BY page, program_name
+           LIMIT 10""",
+        table_id
+    )
+    return [dict(r) for r in rows]
 
 
 @app.get("/health")
