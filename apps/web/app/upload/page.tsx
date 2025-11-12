@@ -118,6 +118,9 @@ export default function UploadPage() {
   const [a, setA] = useState<File | null>(null);
   const [b, setB] = useState<File | null>(null);
   const [result, setResult] = useState<any>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [status, setStatus] = useState<string | null>(null);
+
   const router = useRouter();
 
   async function handle(file: File) {
@@ -137,24 +140,42 @@ export default function UploadPage() {
 
   async function go() {
     if (!a || !b) return;
+    try {
+      const last = await handle(a);
+      const curr = await handle(b);
 
-    const last = await handle(a);
-    const curr = await handle(b);
+      // parse both
+      const lastParse = await parseFile(last.file_id, "Labor-HHS-Education");
+      const currParse = await parseFile(curr.file_id, "Labor-HHS-Education");
 
-    // parse both
-    const lastParse = await parseFile(last.file_id, "Labor-HHS-Education");
-    const currParse = await parseFile(curr.file_id, "Labor-HHS-Education");
+      console.log("lastParse", lastParse);
+      console.log("currParse", currParse);
 
-    // preview rows for the current file (and last if you want)
-    const currPreview = await fetch(
-      `${API}/tables/${currParse.table_id}/preview`
-    ).then((r) => r.json());
+      if (!currParse.audit || currParse.audit.passed !== true) {
+        setResult({ last, curr, lastParse, currParse });
+        setStatus(null);
+        setError("We could not reliably process the current document.");
+        return;
+      }
 
-    const lastPreview = await fetch(
-      `${API}/tables/${lastParse.table_id}/preview`
-    ).then((r) => r.json());
+      // preview rows for the current file (and last if you want)
+      const currPreview = await fetch(
+        `${API}/tables/${currParse.table_id}/preview`
+      ).then((r) => r.json());
 
-    setResult({ last, curr, lastParse, currParse, lastPreview, currPreview });
+      const lastPreview = await fetch(
+        `${API}/tables/${lastParse.table_id}/preview`
+      ).then((r) => r.json());
+
+      setResult({ last, curr, lastParse, currParse, lastPreview, currPreview });
+      setStatus(null);
+    } catch (e) {
+      console.error(e);
+      setStatus(null);
+      setError(
+        e?.message || "Something went wrong while processing the files."
+      );
+    }
   }
 
   useEffect(() => {

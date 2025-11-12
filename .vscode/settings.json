@@ -4,6 +4,7 @@
     "boto",
     "botocore",
     "cand",
+    "ctid",
     "dotenv",
     "fetchrow",
     "minioadmin",

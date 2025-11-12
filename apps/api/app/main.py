@@ -65,6 +65,15 @@ async def ensure_tables():
           page INT,
           checksum TEXT
         );
+
+        CREATE TABLE IF NOT EXISTS audits (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          table_id UUID NOT NULL REFERENCES tables(id) ON DELETE CASCADE,
+          passed BOOLEAN NOT NULL,
+          messages JSONB NOT NULL DEFAULT '[]'::jsonb,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
         -- One-time cleanup is safe to keep; it’s a no-op when already clean.
         WITH d AS (
           SELECT ctid,
@@ -128,6 +137,67 @@ async def register_endpoint(body: RegisterIn, db: asyncpg.Connection = Depends(g
         )
     return {"file_id": str(row["id"]), "sha256": body.sha256, "stored_url": stored_url}
 
+async def audit_table(table_id: str, db: asyncpg.Connection) -> dict:
+    stats = await db.fetchrow(
+        """
+        SELECT
+          COUNT(*) AS row_count,
+          SUM(amount) AS total_amount,
+          SUM(CASE WHEN amount < 0 THEN 1 ELSE 0 END) AS negative_count,
+          SUM(CASE WHEN amount IS NULL OR amount = 0 THEN 1 ELSE 0 END) AS zero_or_null_count
+        FROM rows
+        WHERE table_id = $1::uuid
+        """,
+        table_id,
+    )
+
+    row_count = stats["row_count"] or 0
+    total_amount = stats["total_amount"]
+    negative_count = stats["negative_count"] or 0
+    zero_null_count = stats["zero_or_null_count"] or 0
+
+    messages: list[dict] = []
+
+    if total_amount is None or row_count == 0:
+        messages.append(
+            {"type": "error", "message": "No usable rows found for this table."}
+        )
+        passed = False
+    else:
+        messages.append(
+            {
+                "type": "info",
+                "message": f"Total amount across {row_count} rows: {total_amount}",
+            }
+        )
+        if negative_count:
+            messages.append(
+                {
+                    "type": "warning",
+                    "message": f"{negative_count} rows have negative amounts.",
+                }
+            )
+        if zero_null_count:
+            messages.append(
+                {
+                    "type": "warning",
+                    "message": f"{zero_null_count} rows have zero or missing amounts.",
+                }
+            )
+
+        # MVP pass condition: we have some rows and a total
+        passed = True
+
+    await db.execute(
+        "INSERT INTO audits(table_id, passed, messages) VALUES ($1::uuid, $2, $3)",
+        table_id,
+        passed,
+        json.dumps(messages),
+    )
+
+    return {"passed": passed, "messages": messages}
+
+
 class ParseIn(BaseModel):
     file_id: str
     table_label: str
@@ -178,8 +248,12 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
                 table_id, None, r["program_name"], r["fy"], r["amount"], bbox_json, r["page"], checksum
             )
 
-
-        return {"table_id": str(table_id), "audit": {"passed": True, "messages": []}, "count": len(rows)}
+        audit = await audit_table(str(table_id), db)
+        return {
+            "table_id": str(table_id),
+            "audit": audit,
+            "count": len(rows),
+        }
 
     except HTTPException:
         raise
@@ -187,6 +261,28 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
         # print full error in your uvicorn logs so you can see the stack
         import traceback; traceback.print_exc()
         raise HTTPException(status_code=500, detail="parse failed")
+
+@app.get("/tables/{table_id}/audit")
+async def get_audit(table_id: str, db=Depends(get_db)):
+    row = await db.fetchrow(
+        """
+        SELECT passed, messages, created_at
+        FROM audits
+        WHERE table_id = $1::uuid
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        table_id,
+    )
+    if not row:
+        raise HTTPException(404, "audit not found")
+
+    return {
+        "passed": row["passed"],
+        "messages": row["messages"],
+        "created_at": row["created_at"].isoformat(),
+    }
+
 
 @app.get("/tables/{table_id}/preview")
 async def preview_rows(table_id: str, db=Depends(get_db)):

@@ -9,7 +9,7 @@ export default function Page() {
   const links = [{ href: "/upload", label: "Upload" }];
 
   useEffect(() => {
-    fetch(`${process.env.NEXT_PUBLIC_API_BASE_URL}/health`)
+    fetch(`${process.env.NEXT_PUBLIC_API_URL}/health`)
       .then((r) => r.json())
       .then((j) => setStatus(j.status ?? "unknown"))
       .catch(() => setStatus("down"));
