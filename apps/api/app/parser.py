@@ -2,8 +2,9 @@ import os, re, hashlib, tempfile
 import pdfplumber
 from urllib.parse import urlparse
 from typing import Optional, Tuple, Any, List, Dict
-
 from app.storage import s3
+from botocore.exceptions import ClientError
+from fastapi import HTTPException
 
 NUM_RE = re.compile(r"\(?\$?\s*[\d,]+(?:\.\d{1,2})?\)?")
 
@@ -56,44 +57,56 @@ def find_amount_bbox(page: pdfplumber.page.Page, amount_text: str) -> Optional[L
     return None
 
 def parse_pdf_to_rows(local_path: str) -> List[Dict[str, Any]]:
-    """
-    Returns list of dict rows: {program_name, amount, page, bbox, fy}
-    MVP heuristics:
-      - treat first column as program, last numeric-looking column as amount
-      - FY inferred from any header cell like "FY2025"
-    """
     out: List[Dict[str, Any]] = []
     with pdfplumber.open(local_path) as pdf:
         for pidx, page in enumerate(pdf.pages, start=1):
-            # extract tables; try a couple of table settings
-            tables = page.extract_tables({"explicit_lines": False, "snap_tolerance": 3}) or []
+            # Try lines-first, then text flow as a fallback
+            settings_candidates = [
+                {"vertical_strategy": "lines", "horizontal_strategy": "lines", "snap_tolerance": 3},
+                {"vertical_strategy": "text",  "horizontal_strategy": "text",  "text_x_tolerance": 2, "text_y_tolerance": 2},
+            ]
+
+            tables = []
+            for ts in settings_candidates:
+                try:
+                    tables = page.extract_tables(table_settings=ts) or []
+                except Exception:
+                    tables = []
+                if tables:
+                    break
+
             if not tables:
-                tables = page.extract_tables({"explicit_lines": True}) or []
+                continue
+
             for tbl in tables:
-                if not tbl or len(tbl) < 2:  # need header + at least one data row
+                if not tbl or len(tbl) < 2:
                     continue
+
                 headers = [norm_header(c or "") for c in tbl[0]]
                 fy = detect_fy_from_headers(headers)
 
-                # choose first column as program, last column that looks numeric as amount
-                # (skip empty header rows)
                 for row in tbl[1:]:
-                    if not row or all((c is None or str(c).strip()=="") for c in row):
+                    if not row:
                         continue
                     program = (row[0] or "").strip()
-                    if not program: 
+                    if not program:
                         continue
-                    # find last numeric-ish cell
+
+                    # pick the rightmost numeric cell as amount
                     amount_cell = None
                     for cell in reversed(row):
                         if cell and NUM_RE.search(str(cell)):
                             amount_cell = str(cell)
                             break
-                    amount_val = clean_amount(amount_cell) if amount_cell else None
+                    if not amount_cell:
+                        continue
+
+                    amount_val = clean_amount(amount_cell)
                     if amount_val is None:
                         continue
 
-                    bbox = find_amount_bbox(page, str(amount_cell).strip()) or None
+                    bbox = find_amount_bbox(page, amount_cell) or None
+
                     out.append({
                         "program_name": program,
                         "amount": amount_val,
@@ -105,7 +118,14 @@ def parse_pdf_to_rows(local_path: str) -> List[Dict[str, Any]]:
 
 def download_file_to_tmp(stored_url: str) -> str:
     bucket, key = s3_url_to_bucket_key(stored_url)
-    fd, tmp_path = tempfile.mkstemp(suffix=".pdf")
-    os.close(fd)
-    s3.download_file(bucket, key, tmp_path)
+    fd, tmp_path = tempfile.mkstemp(suffix=".pdf"); os.close(fd)
+    try:
+        s3.download_file(bucket, key, tmp_path)
+    except ClientError as e:
+        try:
+            os.remove(tmp_path)
+        except:
+            pass
+        # Make it a clear 400 so the browser isn’t stuck with a vague 500
+        raise HTTPException(status_code=400, detail=f"S3 object not found: s3://{bucket}/{key}")
     return tmp_path

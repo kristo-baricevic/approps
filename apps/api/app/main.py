@@ -1,5 +1,4 @@
-# apps/api/app/main.py
-import os, hashlib, tempfile, os as _os
+import os, hashlib, tempfile, os as _os, json
 from contextlib import asynccontextmanager
 import asyncpg
 from fastapi import FastAPI, UploadFile, File as F, Depends, HTTPException
@@ -16,6 +15,7 @@ DB_DSN = os.getenv("DATABASE_URL")
 assert DB_DSN, "Missing DATABASE_URL"
 
 pg_pool: asyncpg.pool.Pool | None = None
+print("LOADED:", __file__)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -75,7 +75,7 @@ app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000","http://127.0.0.1:3000"],
+    allow_origin_regex=r"http://(localhost|127\.0\.0\.1):3000",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -87,20 +87,14 @@ class PresignIn(BaseModel):
     content_type: str = "application/pdf"
 
 @app.post("/upload/presign")
-async def presign_endpoint(body: PresignIn):
+async def presign_put_endpoint(body: PresignIn):
     key = f"{body.sha256}/{body.filename}"
-    policy = s3.generate_presigned_post(
-        Bucket=BUCKET,
-        Key=key,
-        Fields={"Content-Type": body.content_type},
-        Conditions=[
-            {"Content-Type": body.content_type},
-            ["content-length-range", 0, 100 * 1024 * 1024],
-        ],
+    put_url = s3.generate_presigned_url(
+        ClientMethod="put_object",
+        Params={"Bucket": BUCKET, "Key": key, "ContentType": body.content_type},
         ExpiresIn=3600,
     )
-    policy["key"] = key
-    return policy
+    return {"url": put_url, "key": key}
 
 class RegisterIn(BaseModel):
     sha256: str
@@ -125,93 +119,43 @@ class ParseIn(BaseModel):
 
 @app.post("/parse")
 async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
-    # fetch file
-    frow = await db.fetchrow("SELECT id, stored_url FROM files WHERE id=$1::uuid", body.file_id)
-    if not frow:
-        raise HTTPException(404, "file not found")
-
-    # insert tables row
-    trow = await db.fetchrow(
-        """INSERT INTO tables (file_id, label, parser_version)
-           VALUES ($1,$2,$3) RETURNING id""",
-        frow["id"], body.table_label, "v0.1"
-    )
-    table_id = trow["id"]
-
-    # download + parse
-    tmp = download_file_to_tmp(frow["stored_url"])
     try:
-        rows = parse_pdf_to_rows(tmp)
-    finally:
-        try: os.remove(tmp)
-        except: pass
+        frow = await db.fetchrow("SELECT id, stored_url FROM files WHERE id=$1::uuid", body.file_id)
+        if not frow:
+            raise HTTPException(404, "file not found")
 
-    # bulk insert rows
-    for r in rows:
-        checksum = md5_row(r["program_name"], r["fy"], r["amount"], r["page"])
-        await db.execute(
-            """INSERT INTO rows (table_id, program_id, program_name, fy, amount, bbox, page, checksum)
-               VALUES ($1,$2,$3,$4,$5,$6,$7,$8)""",
-            table_id, None, r["program_name"], r["fy"], r["amount"], r["bbox"], r["page"], checksum
+        trow = await db.fetchrow(
+            """INSERT INTO tables (file_id, label, parser_version)
+               VALUES ($1,$2,$3) RETURNING id""",
+            frow["id"], body.table_label, "v0.1"
         )
+        table_id = trow["id"]
 
-    # minimal audit stub for Day-3
-    audit = {"passed": True, "messages": []}
+        tmp = download_file_to_tmp(frow["stored_url"])
+        try:
+            rows = parse_pdf_to_rows(tmp)
+        finally:
+            try: os.remove(tmp)
+            except: pass
 
-    return {"table_id": str(table_id), "audit": {"passed": True, "messages": []}, "count": len(rows)}
+        for r in rows:
+            checksum = md5_row(r["program_name"], r["fy"], r["amount"], r["page"])
+            bbox_val = r.get("bbox")
+            bbox_json = json.dumps(bbox_val) if bbox_val else None
+            await db.execute(
+                """INSERT INTO rows (table_id, program_id, program_name, fy, amount, bbox, page, checksum)
+                   VALUES ($1,$2,$3,$4,$5,$6,$7,$8)""",
+                table_id, None, r["program_name"], r["fy"], r["amount"], bbox_json, r["page"], checksum
+            )
 
+        return {"table_id": str(table_id), "audit": {"passed": True, "messages": []}, "count": len(rows)}
 
-
-@app.post("/upload")
-async def upload(file: UploadFile = F(...), db: asyncpg.Connection = Depends(get_db)):
-    if (file.content_type or "") not in ("application/pdf", "application/octet-stream"):
-        raise HTTPException(400, "PDF required")
-
-    # stream to temp file
-    with tempfile.NamedTemporaryFile(delete=False) as tmp:
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
-            tmp.write(chunk)
-        tmp_path = tmp.name
-
-    # sha256
-    h = hashlib.sha256()
-    with open(tmp_path, "rb") as r:
-        for chunk in iter(lambda: r.read(1024 * 1024), b""):
-            h.update(chunk)
-    sha = h.hexdigest()
-
-    # key: sha/filename
-    key = f"{sha}/{file.filename}"
-
-    # upload to MinIO
-    with open(tmp_path, "rb") as r:
-        s3.upload_fileobj(
-            r, BUCKET, key,
-            ExtraArgs={"ContentType": file.content_type or "application/pdf"}
-        )
-    _os.unlink(tmp_path)
-
-    stored_url = f"s3://{BUCKET}/{key}"
-
-    # upsert by sha256
-    existing = await db.fetchrow("SELECT id, stored_url FROM files WHERE sha256=$1", sha)
-    if existing is None:
-        row = await db.fetchrow(
-            """
-            INSERT INTO files (name, sha256, pages, stored_url)
-            VALUES ($1, $2, $3, $4)
-            RETURNING id, sha256, stored_url
-            """,
-            file.filename, sha, None, stored_url
-        )
-        file_id = str(row["id"])
-    else:
-        file_id = str(existing["id"])
-
-    return JSONResponse({"file_id": file_id, "sha256": sha, "stored_url": stored_url})
+    except HTTPException:
+        raise
+    except Exception as e:
+        # print full error in your uvicorn logs so you can see the stack
+        import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail="parse failed")
 
 @app.get("/tables/{table_id}/preview")
 async def preview_rows(table_id: str, db=Depends(get_db)):

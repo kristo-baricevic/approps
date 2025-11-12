@@ -1,6 +1,6 @@
 "use client";
 import { useRouter } from "next/navigation";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 const API = process.env.NEXT_PUBLIC_API_URL as string;
 if (!API) {
@@ -8,7 +8,6 @@ if (!API) {
 }
 
 const fd = new FormData();
-const r = await fetch(`${API}/upload`, { method: "POST", body: fd });
 
 async function sha256Hex(file: File) {
   const buf = await file.arrayBuffer();
@@ -32,13 +31,62 @@ async function presign(sha256: string, file: File) {
 }
 
 async function uploadDirect(presigned: any, file: File) {
-  const form = new FormData();
-  Object.entries(presigned.fields).forEach(([k, v]) =>
-    form.append(k, String(v))
-  );
-  form.append("file", file);
-  const r = await fetch(presigned.url, { method: "POST", body: form });
-  if (!r.ok) throw new Error("s3 upload failed");
+  const contentType = file.type || "application/pdf";
+
+  console.log("Starting upload to:", presigned.url);
+  console.log("File size:", file.size);
+  console.log("Content-Type:", contentType);
+
+  try {
+    const r = await fetch(presigned.url, {
+      method: "PUT",
+      mode: "cors",
+      headers: {
+        "Content-Type": contentType,
+      },
+      body: file,
+    });
+
+    console.log("Response received:");
+    console.log("- Status:", r.status);
+    console.log("- StatusText:", r.statusText);
+    console.log("- OK:", r.ok);
+    console.log("- Headers:", Object.fromEntries(r.headers.entries()));
+
+    // MinIO returns 200 for successful PUT
+    if (r.status === 200) {
+      console.log("✅ Upload successful!");
+      return;
+    }
+
+    // Try to get response body
+    const responseText = await r
+      .text()
+      .catch((e) => `Failed to read response: ${e}`);
+    console.log("Response body:", responseText);
+
+    // Only throw if not 2xx
+    if (!r.ok) {
+      throw new Error(`Upload failed: ${r.status} ${r.statusText}`);
+    }
+  } catch (error) {
+    console.error("Upload error details:", {
+      name: error.name,
+      message: error.message,
+      stack: error.stack,
+    });
+
+    // Check if it's a network error
+    if (error instanceof TypeError && error.message === "Failed to fetch") {
+      console.error("Network error - this could be:");
+      console.error("1. CORS (but we verified this works)");
+      console.error("2. Network timeout");
+      console.error("3. Connection reset");
+      console.error("4. Response parsing issue");
+    }
+
+    throw error;
+  }
 }
 
 async function register(sha256: string, file: File, key: string) {
@@ -52,13 +100,18 @@ async function register(sha256: string, file: File, key: string) {
 }
 
 async function parseFile(fileId: string, tableLabel: string) {
-  const r = await fetch(`${API}/parse`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ file_id: fileId, table_label: tableLabel }),
-  });
-  if (!r.ok) throw new Error(await r.text());
-  return r.json();
+  try {
+    const r = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/parse`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ file_id: fileId, table_label: tableLabel }),
+    });
+    if (!r.ok) throw new Error(await r.text());
+    return r.json();
+  } catch (e) {
+    console.error("parseFile fetch failed:", e);
+    throw e;
+  }
 }
 
 export default function UploadPage() {
@@ -95,6 +148,10 @@ export default function UploadPage() {
     // router.push(`/audit/${currParse.table_id}`);
   }
 
+  useEffect(() => {
+    console.log("result ===> ", result);
+  }, [result]);
+
   return (
     <div className="max-w-xl mx-auto p-6 space-y-4">
       <h1 className="text-xl font-semibold">Upload two PDFs</h1>
@@ -122,11 +179,34 @@ export default function UploadPage() {
       >
         Upload
       </button>
-
-      {result && (
-        <pre className="bg-slate-800 p-3 text-white rounded text-sm overflow-auto">
-          {JSON.stringify(result, null, 2)}
-        </pre>
+      <div>
+        {result && (
+          <pre className="bg-slate-800 p-3 text-white rounded text-sm overflow-auto">
+            {JSON.stringify(result, null, 2)}
+          </pre>
+        )}
+      </div>
+      {result?.curr && result.curr.length > 0 && (
+        <table className="w-full text-sm border mt-4">
+          <thead className="bg-slate-100">
+            <tr>
+              <th className="p-2 text-left">Program</th>
+              <th className="p-2">FY</th>
+              <th className="p-2">Amount</th>
+              <th className="p-2">Page</th>
+            </tr>
+          </thead>
+          <tbody>
+            {result.curr.map((r: any, i: number) => (
+              <tr key={i} className="border-t">
+                <td className="p-2">{r.program_name}</td>
+                <td className="p-2 text-center">{r.fy ?? ""}</td>
+                <td className="p-2 text-right">{r.amount}</td>
+                <td className="p-2 text-center">{r.page}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       )}
     </div>
   );
