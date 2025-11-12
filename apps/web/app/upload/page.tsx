@@ -167,8 +167,28 @@ export default function UploadPage() {
         `${API}/tables/${lastParse.table_id}/preview`
       ).then((r) => r.json());
 
-      setResult({ last, curr, lastParse, currParse, lastPreview, currPreview });
+      const diffRes = await fetch(`${API}/diff`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prev_table_id: lastParse.table_id,
+          curr_table_id: currParse.table_id,
+        }),
+      }).then((r) => r.json());
+
+      // optional: still keep previews in `result` if you like
+      setResult({
+        last,
+        curr,
+        lastParse,
+        currParse,
+        lastPreview,
+        currPreview,
+        diffId: diffRes.diff_id,
+      });
       setStatus(null);
+      // send user straight to the Diff view
+      router.push(`/diff/${diffRes.diff_id}`);
     } catch (e) {
       console.error(e);
       setStatus(null);

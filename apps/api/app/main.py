@@ -74,6 +74,24 @@ async def ensure_tables():
           created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
         );
 
+        CREATE TABLE IF NOT EXISTS diffs (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          prev_table_id UUID NOT NULL REFERENCES tables(id) ON DELETE CASCADE,
+          curr_table_id UUID NOT NULL REFERENCES tables(id) ON DELETE CASCADE,
+          created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        );
+
+        CREATE TABLE IF NOT EXISTS diff_rows (
+          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+          diff_id UUID NOT NULL REFERENCES diffs(id) ON DELETE CASCADE,
+          program_name TEXT,
+          prev_amount BIGINT,
+          curr_amount BIGINT,
+          delta_abs BIGINT,
+          delta_pct DOUBLE PRECISION
+        );
+
+
         -- One-time cleanup is safe to keep; it’s a no-op when already clean.
         WITH d AS (
           SELECT ctid,
@@ -299,6 +317,101 @@ async def preview_rows(table_id: str, db=Depends(get_db)):
         table_id
     )
     return [dict(r) for r in rows]
+
+class DiffIn(BaseModel):
+    prev_table_id: str
+    curr_table_id: str
+
+@app.post("/diff")
+async def create_diff(diff_in: DiffIn, db=Depends(get_db)):
+    prev_id = diff_in.prev_table_id
+    curr_id = diff_in.curr_table_id
+
+    # Create a diff record
+    diff_row = await db.fetchrow(
+        """
+        INSERT INTO diffs (prev_table_id, curr_table_id)
+        VALUES ($1::uuid, $2::uuid)
+        RETURNING id
+        """,
+        prev_id,
+        curr_id,
+    )
+    diff_id = diff_row["id"]
+
+    # Build per-program differences
+    # MVP: join on program_name text
+    await db.execute(
+        """
+        WITH prev AS (
+          SELECT program_name, amount AS prev_amount
+          FROM rows
+          WHERE table_id = $1::uuid
+        ),
+        curr AS (
+          SELECT program_name, amount AS curr_amount
+          FROM rows
+          WHERE table_id = $2::uuid
+        ),
+        joined AS (
+          SELECT
+            COALESCE(p.program_name, c.program_name) AS program_name,
+            p.prev_amount,
+            c.curr_amount
+          FROM prev p
+          FULL OUTER JOIN curr c
+            ON p.program_name = c.program_name
+        )
+        INSERT INTO diff_rows (
+          diff_id, program_name, prev_amount, curr_amount, delta_abs, delta_pct
+        )
+        SELECT
+          $3::uuid,
+          program_name,
+          prev_amount,
+          curr_amount,
+          COALESCE(curr_amount, 0) - COALESCE(prev_amount, 0) AS delta_abs,
+          CASE
+            WHEN prev_amount IS NULL OR prev_amount = 0 THEN NULL
+            ELSE ((COALESCE(curr_amount, 0) - prev_amount)::double precision / prev_amount) * 100.0
+          END AS delta_pct
+        FROM joined
+        WHERE prev_amount IS NOT NULL OR curr_amount IS NOT NULL
+        """,
+        prev_id,
+        curr_id,
+        diff_id,
+    )
+
+    return {"diff_id": str(diff_id)}
+
+@app.get("/diff/{diff_id}")
+async def get_diff(diff_id: str, db=Depends(get_db)):
+    rows = await db.fetch(
+        """
+        SELECT
+          program_name,
+          prev_amount,
+          curr_amount,
+          delta_abs,
+          delta_pct
+        FROM diff_rows
+        WHERE diff_id = $1::uuid
+        ORDER BY ABS(COALESCE(delta_abs, 0)) DESC, program_name
+        """,
+        diff_id,
+    )
+
+    return [
+        {
+            "program_name": r["program_name"],
+            "prev_amount": r["prev_amount"],
+            "curr_amount": r["curr_amount"],
+            "delta_abs": r["delta_abs"],
+            "delta_pct": r["delta_pct"],
+        }
+        for r in rows
+    ]
 
 
 @app.get("/health")
