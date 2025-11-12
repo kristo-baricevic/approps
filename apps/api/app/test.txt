@@ -1,0 +1,16 @@
+// Test direct PUT to MinIO (without presigned URL)
+async function testDirectUpload() {
+  const testBlob = new Blob(['test content'], { type: 'text/plain' });
+  
+  const response = await fetch('http://127.0.0.1:9000/uploads/test.txt', {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'text/plain',
+    },
+    body: testBlob,
+  });
+  
+  console.log('Test upload response:', response.status, response.statusText);
+}
+
+testDirectUpload();

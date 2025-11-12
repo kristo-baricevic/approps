@@ -137,15 +137,24 @@ export default function UploadPage() {
 
   async function go() {
     if (!a || !b) return;
+
     const last = await handle(a);
     const curr = await handle(b);
-    setResult({ last, curr });
 
+    // parse both
     const lastParse = await parseFile(last.file_id, "Labor-HHS-Education");
     const currParse = await parseFile(curr.file_id, "Labor-HHS-Education");
 
-    // go review the Current audit first
-    // router.push(`/audit/${currParse.table_id}`);
+    // preview rows for the current file (and last if you want)
+    const currPreview = await fetch(
+      `${API}/tables/${currParse.table_id}/preview`
+    ).then((r) => r.json());
+
+    const lastPreview = await fetch(
+      `${API}/tables/${lastParse.table_id}/preview`
+    ).then((r) => r.json());
+
+    setResult({ last, curr, lastParse, currParse, lastPreview, currPreview });
   }
 
   useEffect(() => {
@@ -186,9 +195,9 @@ export default function UploadPage() {
           </pre>
         )}
       </div>
-      {result?.curr && result.curr.length > 0 && (
+      {result?.currPreview && result.currPreview.length > 0 && (
         <table className="w-full text-sm border mt-4">
-          <thead className="bg-slate-100">
+          <thead className="bg-slate-600">
             <tr>
               <th className="p-2 text-left">Program</th>
               <th className="p-2">FY</th>
@@ -197,7 +206,7 @@ export default function UploadPage() {
             </tr>
           </thead>
           <tbody>
-            {result.curr.map((r: any, i: number) => (
+            {result.currPreview.map((r: any, i: number) => (
               <tr key={i} className="border-t">
                 <td className="p-2">{r.program_name}</td>
                 <td className="p-2 text-center">{r.fy ?? ""}</td>
