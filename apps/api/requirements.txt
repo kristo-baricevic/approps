@@ -23,3 +23,5 @@ urllib3==2.5.0
 uvicorn==0.38.0
 reportlab==4.4.4
 camelot-py==1.0.9
+python-dotenv
+httpx
