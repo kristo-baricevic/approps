@@ -9,61 +9,82 @@ type LatestTable = {
   file_id: string;
   file_name: string;
   table_label: string;
+  created_at: string;
   file_created_at: string;
-  table_created_at: string;
 };
 
-function formatDateTime(iso: string | null | undefined) {
-  if (!iso) return "—";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleString();
+type LatestTableWithFy = LatestTable & {
+  fy: number | null;
+};
+
+const API = process.env.NEXT_PUBLIC_API_URL as string | undefined;
+
+function extractFiscalYear(name: string): number | null {
+  // Try "FY 2025" / "FY2025"
+  const m4 = name.match(/\bFY\s*?(20\d{2})\b/i);
+  if (m4) return parseInt(m4[1], 10);
+
+  // Try standalone 4-digit 20xx
+  const m4b = name.match(/\b(20\d{2})\b/);
+  if (m4b) return parseInt(m4b[1], 10);
+
+  // Try "FY25" → 2025 (naive but fine for our seeded docs)
+  const m2 = name.match(/\bFY\s*?(\d{2})\b/i);
+  if (m2) {
+    const yy = parseInt(m2[1], 10);
+    return yy >= 90 ? 1900 + yy : 2000 + yy;
+  }
+
+  return null;
+}
+
+function formatDateTime(s: string) {
+  return new Date(s).toLocaleString();
 }
 
 export default function Page() {
   const [status, setStatus] = useState<string>("checking...");
-  const [docs, setDocs] = useState<LatestTable[]>([]);
+  const [docs, setDocs] = useState<LatestTableWithFy[]>([]);
   const [docsError, setDocsError] = useState<string | null>(null);
   const [docsLoading, setDocsLoading] = useState<boolean>(true);
-
-  const [firstCompareId, setFirstCompareId] = useState<string | null>(null);
-  const [firstCompareLabel, setFirstCompareLabel] = useState<string | null>(
+  const [firstCompare, setFirstCompare] = useState<LatestTableWithFy | null>(
     null
   );
-  const [compareLoading, setCompareLoading] = useState(false);
-  const [compareError, setCompareError] = useState<string | null>(null);
 
   const router = useRouter();
+
   const links = [{ href: "/upload", label: "Upload" }];
 
   useEffect(() => {
-    const base = process.env.NEXT_PUBLIC_API_URL;
-    if (!base) {
+    if (!API) {
       setStatus("API URL not configured");
       return;
     }
-    fetch(`${base}/health`)
+    fetch(`${API}/health`)
       .then((r) => r.json())
       .then((j) => setStatus(j.status ?? "unknown"))
       .catch(() => setStatus("down"));
   }, []);
 
   useEffect(() => {
-    const base = process.env.NEXT_PUBLIC_API_URL;
-    if (!base) {
+    if (!API) {
       setDocsError("API URL not configured");
       setDocsLoading(false);
       return;
     }
 
     setDocsLoading(true);
-    fetch(`${base}/tables/latest`)
+    fetch(`${API}/tables/latest`)
       .then((r) => {
         if (!r.ok) throw new Error("failed");
         return r.json();
       })
       .then((data: LatestTable[]) => {
-        setDocs(data);
+        const withFy: LatestTableWithFy[] = data.map((d) => ({
+          ...d,
+          fy: extractFiscalYear(d.file_name),
+        }));
+        setDocs(withFy);
         setDocsLoading(false);
       })
       .catch(() => {
@@ -72,64 +93,62 @@ export default function Page() {
       });
   }, []);
 
-  async function createDiff(prevTableId: string, currTableId: string) {
-    const base = process.env.NEXT_PUBLIC_API_URL;
-    if (!base) {
-      setCompareError("API URL not configured");
+  async function handleDiff(prevTableId: string, currTableId: string) {
+    if (!API) return;
+    const res = await fetch(`${API}/diff`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        prev_table_id: prevTableId,
+        curr_table_id: currTableId,
+      }),
+    });
+
+    if (!res.ok) {
+      const msg = await res.text();
+      console.error("diff failed", msg);
       return;
     }
 
-    try {
-      setCompareLoading(true);
-      setCompareError(null);
-
-      const res = await fetch(`${base}/diff`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prev_table_id: prevTableId,
-          curr_table_id: currTableId,
-        }),
-      });
-
-      if (!res.ok) {
-        const msg = await res.text();
-        throw new Error(msg || "diff failed");
-      }
-
-      const { diff_id } = await res.json();
-      router.push(`/diff/${diff_id}`);
-    } catch (e) {
-      console.error("diff failed", e);
-      setCompareError("Failed to create diff");
-    } finally {
-      setCompareLoading(false);
-    }
+    const { diff_id } = await res.json();
+    router.push(`/diff/${diff_id}`);
   }
 
-  async function handleCompareClick(doc: LatestTable) {
-    if (!doc.table_id) return;
-
-    // first selection
-    if (!firstCompareId) {
-      setFirstCompareId(doc.table_id);
-      setFirstCompareLabel(doc.file_name);
-      setCompareError(null);
+  function handleCompareClick(doc: LatestTableWithFy) {
+    // No FY? just bail for now; could show a toast later.
+    if (!doc.fy) {
+      console.warn("Document has no FY parsed; skipping compare");
       return;
     }
 
-    // clicking the same again cancels
-    if (firstCompareId === doc.table_id) {
-      setFirstCompareId(null);
-      setFirstCompareLabel(null);
-      setCompareError(null);
+    // First selection
+    if (!firstCompare) {
+      setFirstCompare(doc);
       return;
     }
 
-    // second selection → create diff
-    await createDiff(firstCompareId, doc.table_id);
-    setFirstCompareId(null);
-    setFirstCompareLabel(null);
+    // Second selection:
+    // enforce same subcommittee
+    if (firstCompare.table_label !== doc.table_label) {
+      console.warn("Documents must be from same subcommittee to compare");
+      setFirstCompare(null);
+      return;
+    }
+
+    // and different years
+    if (!firstCompare.fy || firstCompare.fy === doc.fy) {
+      console.warn("Documents must be different fiscal years to compare");
+      setFirstCompare(null);
+      return;
+    }
+
+    const prev =
+      firstCompare.fy < doc.fy ? firstCompare.table_id : doc.table_id;
+    const curr =
+      firstCompare.fy < doc.fy ? doc.table_id : firstCompare.table_id;
+
+    handleDiff(prev, curr);
+    setFirstCompare(null);
   }
 
   return (
@@ -159,19 +178,6 @@ export default function Page() {
       <section className="mt-4">
         <h2 className="text-xl font-semibold mb-3">Latest Budget Documents</h2>
 
-        {firstCompareId && (
-          <p className="text-xs text-slate-300 mb-2">
-            Selected first document:{" "}
-            <span className="font-mono">{firstCompareLabel}</span>. Click
-            “Compare” on another document to create a diff. Click “Compare” on
-            the same row again to clear.
-          </p>
-        )}
-
-        {compareError && (
-          <p className="text-xs text-red-400 mb-2">{compareError}</p>
-        )}
-
         {docsLoading && <p className="text-sm text-slate-400">Loading…</p>}
         {docsError && (
           <p className="text-sm text-red-400">Error: {docsError}</p>
@@ -190,6 +196,7 @@ export default function Page() {
                 <tr>
                   <th className="px-4 py-2 text-left">Title</th>
                   <th className="px-4 py-2 text-left">Subcommittee</th>
+                  <th className="px-4 py-2 text-left">FY</th>
                   <th className="px-4 py-2 text-left">Parsed At</th>
                   <th className="px-4 py-2 text-right">Actions</th>
                 </tr>
@@ -197,7 +204,8 @@ export default function Page() {
               <tbody>
                 {docs.map((f) => {
                   const isSelected =
-                    firstCompareId && firstCompareId === f.table_id;
+                    firstCompare && firstCompare.table_id === f.table_id;
+
                   return (
                     <tr
                       key={f.table_id}
@@ -210,22 +218,23 @@ export default function Page() {
                         {f.table_label || "—"}
                       </td>
                       <td className="px-3 py-2 text-xs text-slate-300">
-                        {formatDateTime(f.table_created_at)}
+                        {f.fy ?? "—"}
+                      </td>
+                      <td className="px-3 py-2 text-xs text-slate-300">
+                        {formatDateTime(f.file_created_at)}
                       </td>
                       <td className="px-3 py-2 text-right space-x-2">
-                        {f.table_id && (
-                          <Link
-                            href={`/tables/${f.table_id}`}
-                            className="inline-block rounded-lg border border-slate-700 px-2 py-1 text-xs hover:bg-slate-200 hover:text-slate-900"
-                          >
-                            View
-                          </Link>
-                        )}
+                        <Link
+                          href={`/tables/${f.table_id}`}
+                          className="inline-block rounded-lg border border-slate-700 px-2 py-1 text-xs hover:bg-slate-200 hover:text-slate-900"
+                        >
+                          View
+                        </Link>
                         <button
                           type="button"
                           onClick={() => handleCompareClick(f)}
                           className="inline-block rounded-lg border border-blue-600 px-2 py-1 text-xs hover:bg-blue-500 hover:text-white disabled:opacity-40"
-                          disabled={!f.table_id || compareLoading}
+                          disabled={!f.table_id}
                         >
                           {isSelected ? "Selected…" : "Compare"}
                         </button>
