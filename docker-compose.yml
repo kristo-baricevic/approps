@@ -49,8 +49,8 @@ services:
     ports:
       - "8000:8000"
     volumes:
-      - ./apps/api:/app
-      
+      - ./apps/api:/app/app
+
 volumes:
   pgdata:
   minio:
