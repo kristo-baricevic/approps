@@ -133,7 +133,7 @@ async def main():
 
         for title, meta in DOCS.items():
             try:
-                res = await seed_one_doc(client, title, url)
+                res = await seed_one_doc(client, title, meta)
                 results[title] = res
             except Exception as e:
                 print(f"!!! error while seeding {title}: {e}")
@@ -158,38 +158,41 @@ async def main():
             diff_id = resp.json()["diff_id"]
             print(f"Demo diff {prev_title} → {curr_title}: diff_id = {diff_id}")
 
-async def main():
-    print(">>> seed_latest_docs.py main")
-    print(f">>> BASE_URL = {BASE_URL}")
+    print(">>> seeding complete")
 
-    async with httpx.AsyncClient(timeout=120) as client:
-        results: dict[str, dict] = {}
 
-        for title, url in DOCS.items():
-            try:
-                res = await seed_one_doc(client, title, url)
-                results[title] = res
-            except Exception as e:
-                print(f"!!! error while seeding {title}: {e}")
+# async def main():
+#     print(">>> seed_latest_docs.py main")
+#     print(f">>> BASE_URL = {BASE_URL}")
 
-        # optional diffs
-        for prev_title, curr_title in DEMO_DIFFS:
-            if prev_title not in results or curr_title not in results:
-                print(f"!!! skipping diff {prev_title} -> {curr_title} (missing tables)")
-                continue
+#     async with httpx.AsyncClient(timeout=120) as client:
+#         results: dict[str, dict] = {}
 
-            prev_table_id = results[prev_title]["table_id"]
-            curr_table_id = results[curr_title]["table_id"]
-            resp = await client.post(
-                f"{BASE_URL}/diff",
-                json={
-                    "prev_table_id": prev_table_id,
-                    "curr_table_id": curr_table_id,
-                },
-            )
-            resp.raise_for_status()
-            diff_id = resp.json()["diff_id"]
-            print(f"Demo diff {prev_title} → {curr_title}: diff_id = {diff_id}")
+#         for title, meta in DOCS.items():
+#             try:
+#                 res = await seed_one_doc(client, title, meta)
+#                 results[title] = res
+#             except Exception as e:
+#                 print(f"!!! error while seeding {title}: {e}")
+
+#         # optional diffs
+#         for prev_title, curr_title in DEMO_DIFFS:
+#             if prev_title not in results or curr_title not in results:
+#                 print(f"!!! skipping diff {prev_title} -> {curr_title} (missing tables)")
+#                 continue
+
+#             prev_table_id = results[prev_title]["table_id"]
+#             curr_table_id = results[curr_title]["table_id"]
+#             resp = await client.post(
+#                 f"{BASE_URL}/diff",
+#                 json={
+#                     "prev_table_id": prev_table_id,
+#                     "curr_table_id": curr_table_id,
+#                 },
+#             )
+#             resp.raise_for_status()
+#             diff_id = resp.json()["diff_id"]
+#             print(f"Demo diff {prev_title} → {curr_title}: diff_id = {diff_id}")
 
     print(">>> seeding complete")
 
