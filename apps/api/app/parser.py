@@ -109,12 +109,21 @@ def md5_row(program_name: str, fy: Optional[int], amount: Optional[int], page: i
     return hashlib.md5(payload.encode("utf-8")).hexdigest()
 
 def find_amount_bbox(page: pdfplumber.page.Page, amount_text: str) -> Optional[List[float]]:
-    # try to locate by stripped variants (with/without $/,)
-    cand = set([amount_text, amount_text.replace("$",""), amount_text.replace(",",""),
-                amount_text.replace("$","").replace(",","")])
+    m = NUM_RE.search(amount_text)
+    target = amount_text
+    if m:
+        target = m.group(0)
+
+    cand = set([
+        target,
+        target.replace("$", ""),
+        target.replace(",", ""),
+        target.replace("$", "").replace(",", ""),
+    ])
+
     words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
     for w in words:
-        txt = w.get("text","").strip()
+        txt = (w.get("text") or "").strip()
         if txt in cand:
             return [w["x0"], w["top"], w["x1"], w["bottom"]]
     return None
@@ -130,14 +139,13 @@ def parse_pdf_prose_amounts(local_path: str) -> List[Dict[str, Any]]:
             text = page.extract_text() or ""
             if not text:
                 continue
-            # split on bullet-like markers too
+
             parts = re.split(r"(?:\n|\r|\u2022|\u2023|•|◦|o\s)", text)
             for raw in parts:
                 line = (raw or "").strip()
                 if len(line) < 6:
                     continue
 
-                # find the *rightmost* amount (often the main figure in these bullets)
                 matches = list(AMT_RE.finditer(line))
                 if not matches:
                     continue
@@ -151,26 +159,27 @@ def parse_pdf_prose_amounts(local_path: str) -> List[Dict[str, Any]]:
                 if amt is None:
                     continue
 
-                # polarity
                 if NEG_CUES.search(line):
                     amt = -abs(amt)
 
                 prog = extract_program_phrase(line)
-                # basic quality gate: at least 2 alphabetic tokens (avoid "•", "o", "AGENCIES ACT, 2026", etc.)
                 if len(re.findall(r"[A-Za-z]{2,}", prog)) < 2:
-                    # If it’s the top-line “total discretionary allocation ...” keep it
                     if "total discretionary allocation" not in prog.lower():
                         continue
+
+                # try to locate this amount on the page
+                amount_text = m.group(0)
+                bbox = find_amount_bbox(page, amount_text)
+                print(f"bbox ===> {bbox}")
 
                 out.append({
                     "program_name": prog,
                     "amount": amt,
                     "page": pidx,
-                    "bbox": None,
+                    "bbox": bbox,
                     "fy": None,
                 })
     return out
-
 
 def parse_pdf_to_rows(local_path: str) -> list[dict]:
     out = []
@@ -238,8 +247,17 @@ def parse_pdf_to_rows(local_path: str) -> list[dict]:
                     if amt is None:
                         continue
 
-                    bbox = find_amount_bbox(page, amount_cell) or None
-                    out.append({"program_name": program, "amount": amt, "page": pidx, "bbox": bbox, "fy": fy})
+                    m_amt = AMT_RE.search(amount_cell)
+                    amount_text = m_amt.group(0) if m_amt else amount_cell
+                    bbox = find_amount_bbox(page, amount_text) or None
+
+                    out.append({
+                        "program_name": program,
+                        "amount": amt,
+                        "page": pidx,
+                        "bbox": bbox,
+                        "fy": fy,
+                    })
     return out
 
 def parse_pdf_to_rows_combined(local_path: str) -> List[Dict[str, Any]]:

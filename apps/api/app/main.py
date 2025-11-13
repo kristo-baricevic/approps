@@ -9,6 +9,10 @@ from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
 from app.parser import download_file_to_tmp, parse_pdf_to_rows_combined, parse_pdf_to_rows, md5_row
 import re
+import pdfplumber
+import tempfile
+from decimal import Decimal
+from typing import Any, List, Optional
 
 load_dotenv()
 
@@ -17,6 +21,49 @@ assert DB_DSN, "Missing DATABASE_URL"
 
 pg_pool: asyncpg.pool.Pool | None = None
 print("LOADED:", __file__)
+
+def normalize_bbox(raw: Any) -> Optional[List[float]]:
+    if raw is None:
+        return None
+
+    # If it came back from the DB as a JSON string
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None
+        try:
+            raw = json.loads(s)
+        except json.JSONDecodeError:
+            # Try simple "x0,top,x1,bottom" format
+            parts = [p.strip() for p in s.split(",")]
+            if len(parts) != 4:
+                return None
+            try:
+                return [float(p) for p in parts]
+            except ValueError:
+                return None
+
+    # If it is a dict like {"x0":..., "top":..., "x1":..., "bottom":...}
+    if isinstance(raw, dict):
+        keys = ["x0", "top", "x1", "bottom"]
+        if not all(k in raw for k in keys):
+            return None
+        try:
+            return [float(raw[k]) for k in keys]
+        except (TypeError, ValueError):
+            return None
+
+    # If it is already a list/tuple
+    if isinstance(raw, (list, tuple)):
+        if len(raw) != 4:
+            return None
+        try:
+            return [float(v) if not isinstance(v, Decimal) else float(v) for v in raw]
+        except (TypeError, ValueError):
+            return None
+
+    return None
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -306,7 +353,7 @@ async def get_audit(table_id: str, db=Depends(get_db)):
 async def preview_rows(table_id: str, db=Depends(get_db)):
     rows = await db.fetch(
         """-- replace SELECT in /tables/{table_id}/preview
-            SELECT program_name, fy, amount, page
+            SELECT id, program_name, fy, amount, page
             FROM rows
             WHERE table_id = $1::uuid
             AND length(trim(program_name)) >= 3
@@ -390,14 +437,21 @@ async def get_diff(diff_id: str, db=Depends(get_db)):
     rows = await db.fetch(
         """
         SELECT
-          program_name,
-          prev_amount,
-          curr_amount,
-          delta_abs,
-          delta_pct
-        FROM diff_rows
-        WHERE diff_id = $1::uuid
-        ORDER BY ABS(COALESCE(delta_abs, 0)) DESC, program_name
+          dr.program_name,
+          dr.prev_amount,
+          dr.curr_amount,
+          dr.delta_abs,
+          dr.delta_pct,
+          rc.id AS curr_row_id
+        FROM diff_rows dr
+        JOIN diffs d
+          ON dr.diff_id = d.id
+        LEFT JOIN rows rc
+          ON rc.table_id = d.curr_table_id
+         AND rc.program_name = dr.program_name
+        WHERE dr.diff_id = $1::uuid
+        ORDER BY ABS(COALESCE(dr.delta_abs, 0)) DESC, dr.program_name
+
         """,
         diff_id,
     )
@@ -409,9 +463,141 @@ async def get_diff(diff_id: str, db=Depends(get_db)):
             "curr_amount": r["curr_amount"],
             "delta_abs": r["delta_abs"],
             "delta_pct": r["delta_pct"],
+            "curr_row_id": str(r["curr_row_id"]) if r["curr_row_id"] else None,
         }
         for r in rows
     ]
+
+class RenderIn(BaseModel):
+    row_id: str
+
+import json
+from decimal import Decimal
+from fastapi import HTTPException
+
+@app.post("/render")
+async def render_cell(body: RenderIn, db=Depends(get_db)):
+    row = await db.fetchrow(
+        """
+        SELECT r.page, r.bbox, f.stored_url
+        FROM rows r
+        JOIN tables t ON r.table_id = t.id
+        JOIN files  f ON t.file_id = f.id
+        WHERE r.id = $1::uuid
+        """,
+        body.row_id,
+    )
+    print(f"render ==== row {row}")
+    if not row:
+        raise HTTPException(status_code=404, detail="row not found")
+
+    raw_bbox = row["bbox"]
+    print(f"render ==== bbox raw {raw_bbox} ({type(raw_bbox)})")
+
+    if not raw_bbox:
+        raise HTTPException(status_code=400, detail="no bbox stored for this row")
+
+    # --------- normalize bbox into [x0, top, x1, bottom] ---------
+    bbox = None
+
+    # Case 1: already list/tuple/array-like
+    if isinstance(raw_bbox, (list, tuple)):
+        try:
+            bbox = [float(v) if not isinstance(v, Decimal) else float(v) for v in raw_bbox]
+        except (TypeError, ValueError):
+            bbox = None
+
+    # Case 2: dict with keys
+    elif isinstance(raw_bbox, dict):
+        try:
+            bbox = [
+                float(raw_bbox["x0"]),
+                float(raw_bbox["top"]),
+                float(raw_bbox["x1"]),
+                float(raw_bbox["bottom"]),
+            ]
+        except (KeyError, TypeError, ValueError):
+            bbox = None
+
+    # Case 3: string from DB (json or comma-separated or "(..,..,..,..)")
+    elif isinstance(raw_bbox, str):
+        s = raw_bbox.strip()
+        if s:
+            # try JSON first
+            try:
+                parsed = json.loads(s)
+            except json.JSONDecodeError:
+                # fallback: strip parentheses and split on commas
+                s2 = s.replace("(", "").replace(")", "")
+                parts = [p.strip() for p in s2.split(",")]
+                if len(parts) == 4:
+                    try:
+                        bbox = [float(p) for p in parts]
+                    except ValueError:
+                        bbox = None
+            else:
+                # json was ok
+                if isinstance(parsed, (list, tuple)):
+                    try:
+                        bbox = [float(v) for v in parsed]
+                    except (TypeError, ValueError):
+                        bbox = None
+                elif isinstance(parsed, dict):
+                    try:
+                        bbox = [
+                            float(parsed["x0"]),
+                            float(parsed["top"]),
+                            float(parsed["x1"]),
+                            float(parsed["bottom"]),
+                        ]
+                    except (KeyError, TypeError, ValueError):
+                        bbox = None
+
+    if not bbox or len(bbox) < 4:
+        print("render ==== normalized bbox is invalid:", bbox)
+        raise HTTPException(status_code=400, detail="invalid bbox format for this row")
+
+    x0, top, x1, bottom = bbox[:4]
+    # --------- end bbox normalization ---------
+
+    page_num = row["page"] or 1
+    stored_url = row["stored_url"]
+
+    pdf_path = download_file_to_tmp(stored_url)
+
+    fd, png_path = tempfile.mkstemp(suffix=".png")
+    _os.close(fd)
+
+    try:
+        with pdfplumber.open(pdf_path) as pdf:
+            page_index = max(0, page_num - 1)
+            if page_index >= len(pdf.pages):
+                page_index = len(pdf.pages) - 1
+            page = pdf.pages[page_index]
+
+            img = page.to_image(resolution=150)
+            img.draw_rect((x0, top, x1, bottom), fill=None, stroke="red", stroke_width=3)
+            img.save(png_path, format="PNG")
+    finally:
+        try:
+            _os.remove(pdf_path)
+        except:
+            pass
+
+    key = f"renders/{body.row_id}.png"
+    s3.upload_file(png_path, BUCKET, key, ExtraArgs={"ContentType": "image/png"})
+    try:
+        _os.remove(png_path)
+    except:
+        pass
+
+    url = s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": BUCKET, "Key": key},
+        ExpiresIn=3600,
+    )
+
+    return {"url": url}
 
 
 @app.get("/health")

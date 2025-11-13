@@ -14,6 +14,7 @@ type DiffRow = {
   curr_amount: number | null;
   delta_abs: number | null;
   delta_pct: number | null;
+  curr_row_id: string | null;
 };
 
 export default function DiffPage() {
@@ -23,15 +24,26 @@ export default function DiffPage() {
   const [rows, setRows] = useState<DiffRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [filter, setFilter] = useState<"all" | "increases" | "cuts">("all");
+  const [renderUrl, setRenderUrl] = useState<string | null>(null);
+  const [renderingRowId, setRenderingRowId] = useState<string | null>(null);
+  const [renderLoading, setRenderLoading] = useState(false);
 
   useEffect(() => {
     if (!diffId) return;
     setLoading(true);
     fetch(`${API}/diff/${diffId}`)
-      .then((r) => r.json())
+      .then((r) => (r.ok ? r.json() : r.text().then((t) => Promise.reject(t))))
       .then((data) => setRows(data))
+      .catch((e) => {
+        console.error(e);
+        setRows([]);
+      })
       .finally(() => setLoading(false));
   }, [diffId]);
+
+  useEffect(() => {
+    console.log("renderUrl ", renderUrl);
+  }, [renderUrl]);
 
   const filtered = rows.filter((r) => {
     if (filter === "all") return true;
@@ -39,6 +51,33 @@ export default function DiffPage() {
     if (filter === "cuts") return (r.delta_abs ?? 0) < 0;
     return true;
   });
+
+  async function viewSource(row: DiffRow) {
+    if (!row.curr_row_id) return;
+    try {
+      setRenderLoading(true);
+      setRenderingRowId(row.curr_row_id);
+      setRenderUrl(null);
+
+      const r = await fetch(`${API}/render`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ row_id: row.curr_row_id }),
+      });
+
+      if (!r.ok) {
+        const msg = await r.text();
+        throw new Error(msg || "render failed");
+      }
+
+      const data = await r.json();
+      setRenderUrl(data.url);
+    } catch (e) {
+      console.error("viewSource failed", e);
+    } finally {
+      setRenderLoading(false);
+    }
+  }
 
   return (
     <main className="p-6 max-w-5xl mx-auto space-y-4">
@@ -72,6 +111,7 @@ export default function DiffPage() {
               <th className="p-2 text-right">Curr</th>
               <th className="p-2 text-right">Δ (abs)</th>
               <th className="p-2 text-right">Δ (%)</th>
+              <th className="p-2 text-center">Source</th>
             </tr>
           </thead>
           <tbody>
@@ -90,10 +130,48 @@ export default function DiffPage() {
                 <td className="p-2 text-right">
                   {r.delta_pct != null ? `${r.delta_pct.toFixed(1)}%` : "—"}
                 </td>
+                <td className="p-2 text-center">
+                  <button
+                    className="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 cursor-pointer"
+                    onClick={() => viewSource(r)}
+                  >
+                    View source
+                  </button>
+                </td>
               </tr>
             ))}
           </tbody>
         </table>
+      )}
+      {renderingRowId && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
+          <div className="bg-slate-900 rounded-lg p-4 max-w-3xl w-full max-h-[90vh] flex flex-col">
+            <div className="flex justify-between items-center mb-2">
+              <h2 className="text-sm font-semibold">Source highlight</h2>
+              <button
+                className="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600"
+                onClick={() => {
+                  setRenderingRowId(null);
+                  setRenderUrl(null);
+                }}
+              >
+                Close
+              </button>
+            </div>
+            {renderLoading && (
+              <p className="text-slate-300 text-xs mb-2">Rendering…</p>
+            )}
+            {renderUrl && (
+              <div className="flex-1 overflow-auto">
+                <img
+                  src={renderUrl}
+                  alt="highlighted source cell"
+                  className="max-w-full h-auto mx-auto"
+                />
+              </div>
+            )}
+          </div>
+        </div>
       )}
     </main>
   );
