@@ -1,5 +1,6 @@
 {
   "cSpell.words": [
+    "APPROPS",
     "asyncpg",
     "boto",
     "botocore",
@@ -9,6 +10,7 @@
     "fetchrow",
     "headstart",
     "HRSA",
+    "httpx",
     "jobcorps",
     "LIHEAP",
     "minioadmin",
@@ -19,6 +21,7 @@
     "pdfplumber",
     "Pell",
     "pidx",
+    "precompute",
     "presign",
     "pydantic",
     "reportlab",

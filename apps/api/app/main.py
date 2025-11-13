@@ -795,6 +795,77 @@ async def brief_pdf(diff_id: str, db=Depends(get_db)):
     return Response(content=pdf_bytes, media_type="application/pdf",
                     headers={"Content-Disposition": f'attachment; filename=\"{filename}\"'})
 
+@app.get("/tables/latest")
+async def list_latest_tables(limit: int = 20, db=Depends(get_db)):
+    rows = await db.fetch(
+        """
+        SELECT
+          t.id   AS table_id,
+          f.name AS file_name,
+          t.label AS table_label,
+          t.created_at
+        FROM tables t
+        JOIN files f ON t.file_id = f.id
+        ORDER BY t.created_at DESC
+        LIMIT $1
+        """,
+        limit,
+    )
+
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        out.append({
+            "table_id": str(r["table_id"]),
+            "file_name": r["file_name"],
+            "table_label": r["table_label"],
+            "created_at": r["created_at"].isoformat(),
+        })
+    return out
+
+@app.get("/tables/{table_id}")
+async def get_table(table_id: str, db=Depends(get_db)):
+    # Table metadata
+    table = await db.fetchrow(
+        """
+        SELECT t.id, t.label, t.created_at, f.name AS file_name
+        FROM tables t
+        JOIN files f ON t.file_id = f.id
+        WHERE t.id = $1::uuid
+        """,
+        table_id,
+    )
+
+    if not table:
+        raise HTTPException(status_code=404, detail="table not found")
+
+    # Table rows
+    rows = await db.fetch(
+        """
+        SELECT program_name, amount, page, bbox, fy
+        FROM rows
+        WHERE table_id = $1::uuid
+        ORDER BY page, program_name
+        """,
+        table_id,
+    )
+
+    return {
+        "table_id": str(table["id"]),
+        "file_name": table["file_name"],
+        "table_label": table["label"],
+        "created_at": table["created_at"].isoformat(),
+        "rows": [
+            {
+                "program_name": r["program_name"],
+                "amount": r["amount"],
+                "page": r["page"],
+                "bbox": r["bbox"],
+                "fy": r["fy"],
+            }
+            for r in rows
+        ],
+    }
+
 
 @app.get("/health")
 def health():

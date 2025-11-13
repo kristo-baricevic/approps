@@ -110,7 +110,7 @@ def normalize_program_name_for_id(name: str) -> str:
         return ""
     s = name.lower()
     s = re.sub(r"&", "and", s)
-    s = re.sub(r"[^a-z0-9\s]", "", s)   # drop punctuation
+    s = re.sub(r"[^a-z0-9\s]", "", s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
@@ -299,7 +299,6 @@ def parse_pdf_prose_amounts(local_path: str) -> List[Dict[str, Any]]:
                 # try to locate this amount on the page
                 amount_text = m.group(0)
                 bbox = find_amount_bbox(page, amount_text)
-                print(f"bbox ===> {bbox}")
 
                 out.append({
                     "program_name": prog,
