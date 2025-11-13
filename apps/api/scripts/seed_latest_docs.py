@@ -6,7 +6,9 @@ import httpx
 
 print(">>> seed_latest_docs.py imported") 
 
-BASE_URL = os.getenv("APPROPS_API_BASE_URL", "http://localhost:8000")
+# BASE_URL = os.getenv("APPROPS_API_BASE_URL", "http://localhost:8000")
+BASE_URL = os.getenv("APPROPS_API_BASE_URL", "http://64.225.3.60:8000")
+
 
 DOCS = {
     "FY25 House Labor–HHS Draft": {
