@@ -16,3 +16,9 @@ __pycache__/
 *.py[cod]
 .vscode/
 .minio-data/.minio.sys/buckets/.usage.json/xl.meta
+.minio-data/.minio.sys/buckets/.bloomcycle.bin/xl.meta
+.minio-data/.minio.sys/buckets/.usage-cache.bin/xl.meta
+.minio-data/.minio.sys/buckets/.usage-cache.bin.bkp/xl.meta
+.minio-data/.minio.sys/buckets/.usage.json/xl.meta
+.minio-data/.minio.sys/buckets/uploads/.usage-cache.bin/xl.meta
+.minio-data/.minio.sys/buckets/uploads/.usage-cache.bin.bkp/xl.meta
