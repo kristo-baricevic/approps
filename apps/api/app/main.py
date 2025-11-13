@@ -7,7 +7,7 @@ from app.storage import s3, BUCKET, ensure_bucket
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
-from app.parser import download_file_to_tmp, get_program_id, parse_pdf_to_rows_combined, parse_pdf_to_rows, md5_row
+from app.parser import download_file_to_tmp, get_program_id, clean_program_title, parse_pdf_to_rows_combined, parse_pdf_to_rows, md5_row, s3_url_to_bucket_key
 import re
 import pdfplumber
 import tempfile
@@ -16,6 +16,7 @@ from typing import Any, List, Optional
 import io, csv
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
+from botocore.exceptions import ClientError
 
 load_dotenv()
 
@@ -292,18 +293,48 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
             except: pass
 
         clean_rows = []
+
         for r in rows:
-            name = r["program_name"]
-            if len(name) < 4: 
+            raw_name = r.get("program_name") or ""
+            name = clean_program_title(raw_name)
+
+            if len(name) < 4:
                 continue
-            # must contain at least 2 alphabetic tokens (avoid “a total d”, “o”, “•”)
+
+            # must contain at least 2 alphabetic tokens (avoid “a total d”, “o”, “•”, “period”)
             if len([t for t in re.findall(r"[A-Za-z]+", name) if len(t) >= 2]) < 2:
                 continue
+
             if r["amount"] is None:
                 continue
+
+            # store the cleaned title back on the row so everything downstream (diff, render) sees it
+            r["program_name"] = name
             clean_rows.append(r)
 
         rows = clean_rows
+
+        for r in rows:
+            name = r["program_name"]  # already cleaned
+            program_id = get_program_id(name)
+
+            checksum = md5_row(name, r["fy"], r["amount"], r["page"])
+            bbox_val = r.get("bbox")
+            bbox_json = json.dumps(bbox_val) if bbox_val else None
+
+            await db.execute(
+                """INSERT INTO rows (table_id, program_id, program_name, fy, amount, bbox, page, checksum)
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
+                ON CONFLICT (table_id, checksum) DO NOTHING""",
+                table_id,
+                program_id,
+                name,
+                r["fy"],
+                r["amount"],
+                bbox_json,
+                r["page"],
+                checksum,
+            )
 
         for r in rows:
             name = r["program_name"]
@@ -803,7 +834,8 @@ async def list_latest_tables(limit: int = 20, db=Depends(get_db)):
           t.id   AS table_id,
           f.name AS file_name,
           t.label AS table_label,
-          t.created_at
+          t.created_at,
+          f.stored_url
         FROM tables t
         JOIN files f ON t.file_id = f.id
         ORDER BY t.created_at DESC
@@ -812,15 +844,32 @@ async def list_latest_tables(limit: int = 20, db=Depends(get_db)):
         limit,
     )
 
-    out: list[dict[str, Any]] = []
+    visible: list[dict[str, Any]] = []
+
     for r in rows:
-        out.append({
+        stored_url = r["stored_url"]
+        try:
+            bucket, key = s3_url_to_bucket_key(stored_url)
+            # HEAD is cheap and doesn’t pull the whole object
+            s3.head_object(Bucket=bucket, Key=key)
+        except ClientError as e:
+            code = e.response.get("Error", {}).get("Code", "")
+            # If the object is gone, skip this table
+            if code in ("NoSuchKey", "404", "NotFound"):
+                continue
+            # any other S3 error: be conservative and still include it
+        except Exception:
+            # if S3 is flaky, don't blow up the endpoint
+            pass
+
+        visible.append({
             "table_id": str(r["table_id"]),
             "file_name": r["file_name"],
             "table_label": r["table_label"],
             "created_at": r["created_at"].isoformat(),
         })
-    return out
+
+    return visible
 
 @app.get("/tables/{table_id}")
 async def get_table(table_id: str, db=Depends(get_db)):

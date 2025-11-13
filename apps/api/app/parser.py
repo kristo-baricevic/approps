@@ -6,7 +6,10 @@ from app.storage import s3
 from botocore.exceptions import ClientError
 from fastapi import HTTPException
 import camelot
+import re
 
+NUM_CURRENCY_RE = re.compile(r"\(?\$\s*[\d,]+(?:\.\d{1,2})?\)?")
+UNIT_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*(billion|million)\b", re.I)
 NUM_RE = re.compile(r"\(?\$?\s*[\d,]+(?:\.\d{1,2})?\)?")
 FY_RE  = re.compile(r"\bFY\s*([12]\d{3})\b", re.I)
 
@@ -103,6 +106,51 @@ PROGRAM_ALIAS_MAP: dict[str, str] = {
     "public housing capital fund": "HUD_PublicHousing",
     "public housing operating fund": "HUD_PublicHousing",
 }
+
+JUNK_PROGRAM_RE = re.compile(
+    r"""
+    ^\s*(
+        total|
+        subtotal|
+        administrative\ expenses|
+        administration|
+        offsetting\ collections|
+        rescission|
+        rescissions|
+        appropriation|
+        appropriations|
+        new\ budget\ authority|
+        advance\ appropriation|
+        limitation\ on\ obligations|
+        obligations\ limitation|
+        discretionary\ budget\ authority|
+        mandatory\ budget\ authority|
+        salary\ and\ expenses|
+        salaries\ and\ expenses
+    )\b
+    """,
+    re.I | re.X,
+)
+
+
+def looks_like_program_name(program: str) -> bool:
+    if not program:
+        return False
+    s = program.strip()
+    if len(s) < 4:
+        return False
+
+    tokens = [t for t in re.findall(r"[A-Za-z]+", s) if len(t) >= 3]
+    if len(tokens) < 2:
+        return False
+
+    if JUNK_PROGRAM_RE.search(s):
+        return False
+
+    if s.endswith(":"):
+        return False
+
+    return True
 
 
 def normalize_program_name_for_id(name: str) -> str:
@@ -239,81 +287,44 @@ def md5_row(program_name: str, fy: Optional[int], amount: Optional[int], page: i
 
 def find_amount_bbox(page: pdfplumber.page.Page, amount_text: str) -> Optional[List[float]]:
     m = NUM_RE.search(amount_text)
-    target = amount_text
-    if m:
-        target = m.group(0)
+    target = m.group(0) if m else amount_text
 
-    cand = set([
-        target,
-        target.replace("$", ""),
-        target.replace(",", ""),
-        target.replace("$", "").replace(",", ""),
-    ])
+    target_digits = re.sub(r"[^\d.]", "", target)
+    if not target_digits:
+        return None
 
-    words = page.extract_words(use_text_flow=True, keep_blank_chars=False)
+    try:
+        words = page.extract_words(
+            x_tolerance=3,
+            y_tolerance=3,
+            keep_blank_chars=True,
+            use_text_flow=False,
+        )
+    except TypeError:
+        words = page.extract_words(use_text_flow=False, keep_blank_chars=True)
+
     for w in words:
         txt = (w.get("text") or "").strip()
-        if txt in cand:
+        if not txt:
+            continue
+
+        w_digits = re.sub(r"[^\d.]", "", txt)
+        if not w_digits:
+            continue
+
+        if (
+            w_digits == target_digits
+            or target_digits in w_digits
+            or w_digits in target_digits
+        ):
             return [w["x0"], w["top"], w["x1"], w["bottom"]]
+
     return None
 
-import re
-NUM_CURRENCY_RE = re.compile(r"\(?\$\s*[\d,]+(?:\.\d{1,2})?\)?")
-UNIT_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*(billion|million)\b", re.I)
-
-def parse_pdf_prose_amounts(local_path: str) -> List[Dict[str, Any]]:
-    out: List[Dict[str, Any]] = []
-    with pdfplumber.open(local_path) as pdf:
-        for pidx, page in enumerate(pdf.pages, start=1):
-            text = page.extract_text() or ""
-            if not text:
-                continue
-
-            parts = re.split(r"(?:\n|\r|\u2022|\u2023|•|◦|o\s)", text)
-            for raw in parts:
-                line = (raw or "").strip()
-                if len(line) < 6:
-                    continue
-
-                matches = list(AMT_RE.finditer(line))
-                if not matches:
-                    continue
-
-                m = matches[-1]
-                amt = to_whole_dollars(
-                    m.group("num"),
-                    m.group("unit"),
-                    had_dollar_prefix=bool(m.group("prefix")),
-                )
-                if amt is None:
-                    continue
-
-                if NEG_CUES.search(line):
-                    amt = -abs(amt)
-
-                prog = extract_program_phrase(line)
-                if len(re.findall(r"[A-Za-z]{2,}", prog)) < 2:
-                    if "total discretionary allocation" not in prog.lower():
-                        continue
-
-                # try to locate this amount on the page
-                amount_text = m.group(0)
-                bbox = find_amount_bbox(page, amount_text)
-
-                out.append({
-                    "program_name": prog,
-                    "amount": amt,
-                    "page": pidx,
-                    "bbox": bbox,
-                    "fy": None,
-                })
-    return out
-
 def parse_pdf_to_rows(local_path: str) -> list[dict]:
-    out = []
+    out: list[dict] = []
     with pdfplumber.open(local_path) as pdf:
         for pidx, page in enumerate(pdf.pages, start=1):
-            # tables only; skip prose-only pages
             settings_candidates = [
                 {"vertical_strategy": "lines", "horizontal_strategy": "lines", "snap_tolerance": 3},
                 {"vertical_strategy": "text",  "horizontal_strategy": "text",  "text_x_tolerance": 2, "text_y_tolerance": 2},
@@ -338,20 +349,19 @@ def parse_pdf_to_rows(local_path: str) -> list[dict]:
             for tbl in tables:
                 if not tbl or len(tbl) < 2:
                     continue
+
                 headers = [norm_header(c or "") for c in tbl[0]]
                 fy = detect_fy_from_headers(headers)
 
                 for row in tbl[1:]:
-                    if not row: 
-                        continue
-                    program = (row[0] or "").strip()
-                    # filter junky program names
-                    if len(program) < 4:
-                        continue
-                    if len([t for t in re.findall(r"[A-Za-z]+", program) if len(t) >= 2]) < 2:
+                    if not row:
                         continue
 
-                    # pick rightmost money-looking cell
+                    program = (row[0] or "").strip()
+
+                    if not looks_like_program_name(program):
+                        continue
+
                     amount_cell = None
                     for cell in reversed(row):
                         if not cell:
@@ -367,10 +377,8 @@ def parse_pdf_to_rows(local_path: str) -> list[dict]:
                     if not amount_cell:
                         continue
 
-                    # normalize amount (handles $x,xxx and N billion/million)
                     amt = clean_amount(amount_cell)
                     if amt is None:
-                        # try unit conversion
                         m = UNIT_RE.search(amount_cell)
                         if m:
                             val = float(m.group(1))
@@ -393,19 +401,97 @@ def parse_pdf_to_rows(local_path: str) -> list[dict]:
                     })
     return out
 
+import re
+NUM_CURRENCY_RE = re.compile(r"\(?\$\s*[\d,]+(?:\.\d{1,2})?\)?")
+UNIT_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*(billion|million)\b", re.I)
+
+
+def is_likely_appropriation_line(line: str) -> bool:
+    s = (line or "").strip()
+    if not s:
+        return False
+
+    if not (NUM_CURRENCY_RE.search(s) or UNIT_RE.search(s)):
+        return False
+
+    s = re.sub(r"^\s*\d+\s+", "", s)
+    s = re.sub(r"^\s*\d+\.\s+", "", s)
+
+    if re.search(r"\bFor\b", s, flags=re.I):
+        return True
+    if re.search(r"\bnecessary expenses\b", s, flags=re.I):
+        return True
+    if re.search(r"\bappropriat(?:ed|ion|ions)\b", s, flags=re.I):
+        return True
+    if re.search(r"\bto remain available until\b", s, flags=re.I):
+        return True
+    if re.search(r"\bgrants to\b", s, flags=re.I):
+        return True
+
+    return False
+
+
+def parse_pdf_prose_amounts(local_path: str) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    with pdfplumber.open(local_path) as pdf:
+        for pidx, page in enumerate(pdf.pages, start=1):
+            text = page.extract_text() or ""
+            if not text:
+                continue
+
+            parts = re.split(r"(?:\n|\r|\u2022|\u2023|•|◦|o\s)", text)
+            for raw in parts:
+                line = (raw or "").strip()
+                if len(line) < 6:
+                    continue
+
+                if not is_likely_appropriation_line(line):
+                    continue
+
+                matches = list(AMT_RE.finditer(line))
+                if not matches:
+                    continue
+
+                m = matches[-1]
+                amt = to_whole_dollars(
+                    m.group("num"),
+                    m.group("unit"),
+                    had_dollar_prefix=bool(m.group("prefix")),
+                )
+                if amt is None:
+                    continue
+
+                if NEG_CUES.search(line):
+                    amt = -abs(amt)
+
+                prog = extract_program_phrase(line)
+                if len(re.findall(r"[A-Za-z]{2,}", prog)) < 2:
+                    if "total discretionary allocation" not in prog.lower():
+                        continue
+
+                amount_text = m.group(0)
+                bbox = find_amount_bbox(page, amount_text)
+
+                out.append({
+                    "program_name": prog,
+                    "amount": amt,
+                    "page": pidx,
+                    "bbox": bbox,
+                    "fy": None,
+                })
+    return out
+
 def parse_pdf_to_rows_combined(local_path: str) -> List[Dict[str, Any]]:
     rows: List[Dict[str, Any]] = []
     try:
-        rows.extend(parse_pdf_to_rows(local_path))  # your existing (tables) function
+        rows.extend(parse_pdf_to_rows(local_path))
     except Exception:
-        # don’t fail the whole parse if tables logic breaks
         pass
     try:
         rows.extend(parse_pdf_prose_amounts(local_path))
     except Exception:
         pass
     return rows
-
 
 def download_file_to_tmp(stored_url: str) -> str:
     bucket, key = s3_url_to_bucket_key(stored_url)
@@ -420,3 +506,30 @@ def download_file_to_tmp(stored_url: str) -> str:
         # Make it a clear 400 so the browser isn’t stuck with a vague 500
         raise HTTPException(status_code=400, detail=f"S3 object not found: s3://{bucket}/{key}")
     return tmp_path
+
+def clean_program_title(text: str) -> str:
+    s = (text or "").strip()
+
+    # strip leading bullets like "(1)", "(A)", "(i)"
+    s = re.sub(r"^\s*[\(\[]\s*[0-9A-Za-z]+\s*[\)\]]\s*", "", s)
+
+    # grab the last "for ..." clause if present
+    matches = list(re.finditer(r"\bfor\s+(.+)", s, flags=re.I))
+    if matches:
+        frag = matches[-1].group(1)
+    else:
+        frag = s
+
+    # drop leading "the"/"such"
+    frag = re.sub(r"^\s*(the|such)\s+", "", frag, flags=re.I)
+
+    # cut at the first comma to avoid "..., of which ..." etc.
+    frag = frag.split(",", 1)[0]
+
+    # drop trailing junk like "that / which / shall / including"
+    for pat in [r"\s+that\b", r"\s+which\b", r"\s+who\b", r"\s+shall\b", r"\s+including\b"]:
+        frag = re.split(pat, frag, 1, flags=re.I)[0]
+
+    frag = frag.strip(" ,.;:-")
+
+    return frag.lower()
