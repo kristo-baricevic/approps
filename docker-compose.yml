@@ -50,20 +50,20 @@ services:
     volumes:
       - ./apps/api:/app
 
-  web:
-    build: ./apps/web
-    depends_on:
-      api:
-        condition: service_started
-    environment:
-      NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
-      PORT: 3000
-    ports:
-      - "3000:3000"
-    volumes:
-      - ./apps/web:/usr/src/app
-      - /usr/src/app/node_modules
-    command: ["npm","run","dev"]
+  # web:
+  #   build: ./apps/web
+  #   depends_on:
+  #     api:
+  #       condition: service_started
+  #   environment:
+  #     NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
+  #     PORT: 3000
+  #   ports:
+  #     - "3000:3000"
+  #   volumes:
+  #     - ./apps/web:/usr/src/app
+  #     - /usr/src/app/node_modules
+  #   command: ["npm","run","dev"]
 
 volumes:
   pgdata:
