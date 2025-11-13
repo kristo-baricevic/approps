@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 
 type LatestTable = {
@@ -42,6 +42,16 @@ function formatDateTime(s: string) {
   return new Date(s).toLocaleString();
 }
 
+// Strip "FYxx"/"FY 2025" prefix for title sorting
+function sortableTitle(name: string): string {
+  return name
+    .replace(/^FY\s*\d{2,4}\s*/i, "")
+    .trim()
+    .toLowerCase();
+}
+
+type SortKey = "title" | "subcommittee" | "fy" | null;
+
 export default function Page() {
   const [status, setStatus] = useState<string>("checking...");
   const [docs, setDocs] = useState<LatestTableWithFy[]>([]);
@@ -50,10 +60,15 @@ export default function Page() {
   const [firstCompare, setFirstCompare] = useState<LatestTableWithFy | null>(
     null
   );
+  const [sortKey, setSortKey] = useState<SortKey>(null);
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
 
   const router = useRouter();
 
-  const links = [{ href: "/upload", label: "Upload" }];
+  const links = [
+    { href: "/upload", label: "Upload" },
+    { href: "/about", label: "About" },
+  ];
 
   useEffect(() => {
     if (!API) {
@@ -93,6 +108,45 @@ export default function Page() {
       });
   }, []);
 
+  function handleSort(nextKey: SortKey) {
+    if (!nextKey) return;
+    if (sortKey === nextKey) {
+      setSortDir((prev) => (prev === "asc" ? "desc" : "asc"));
+    } else {
+      setSortKey(nextKey);
+      setSortDir("asc");
+    }
+  }
+
+  const sortedDocs = useMemo(() => {
+    if (!sortKey) return docs;
+
+    const sorted = [...docs].sort((a, b) => {
+      let cmp = 0;
+
+      if (sortKey === "title") {
+        const aTitle = sortableTitle(a.file_name);
+        const bTitle = sortableTitle(b.file_name);
+        cmp = aTitle.localeCompare(bTitle);
+      } else if (sortKey === "subcommittee") {
+        const aLabel = (a.table_label || "").toLowerCase();
+        const bLabel = (b.table_label || "").toLowerCase();
+        cmp = aLabel.localeCompare(bLabel);
+      } else if (sortKey === "fy") {
+        const aFy = a.fy;
+        const bFy = b.fy;
+        if (aFy == null && bFy == null) cmp = 0;
+        else if (aFy == null) cmp = 1; // nulls last
+        else if (bFy == null) cmp = -1;
+        else cmp = aFy - bFy;
+      }
+
+      return sortDir === "asc" ? cmp : -cmp;
+    });
+
+    return sorted;
+  }, [docs, sortKey, sortDir]);
+
   async function handleDiff(prevTableId: string, currTableId: string) {
     if (!API) return;
     const res = await fetch(`${API}/diff`, {
@@ -115,27 +169,22 @@ export default function Page() {
   }
 
   function handleCompareClick(doc: LatestTableWithFy) {
-    // No FY? just bail for now; could show a toast later.
     if (!doc.fy) {
       console.warn("Document has no FY parsed; skipping compare");
       return;
     }
 
-    // First selection
     if (!firstCompare) {
       setFirstCompare(doc);
       return;
     }
 
-    // Second selection:
-    // enforce same subcommittee
     if (firstCompare.table_label !== doc.table_label) {
       console.warn("Documents must be from same subcommittee to compare");
       setFirstCompare(null);
       return;
     }
 
-    // and different years
     if (!firstCompare.fy || firstCompare.fy === doc.fy) {
       console.warn("Documents must be different fiscal years to compare");
       setFirstCompare(null);
@@ -151,15 +200,17 @@ export default function Page() {
     setFirstCompare(null);
   }
 
+  const sortIndicator = (key: SortKey) =>
+    sortKey === key ? (sortDir === "asc" ? " ↑" : " ↓") : "";
+
   return (
     <main className="p-6">
       <h1 className="text-2xl font-semibold mb-2">Appropriations Parser</h1>
       <p className="mb-6">
         API health: <span className="font-mono">{status}</span>
       </p>
-
-      <div className="rounded-2xl border border-slate-700 p-6 mb-6">
-        <nav className="border-b border-black/10">
+      <div className="rounded-2xl border border-slate-700 bg-slate-900/60 p-2 mb-6">
+        <nav className="">
           <ul className="flex sm:space-x-4 justify-center">
             {links.map((link) => (
               <li
@@ -174,7 +225,6 @@ export default function Page() {
           </ul>
         </nav>
       </div>
-
       <section className="mt-4">
         <h2 className="text-xl font-semibold mb-3">Latest Budget Documents</h2>
 
@@ -183,26 +233,41 @@ export default function Page() {
           <p className="text-sm text-red-400">Error: {docsError}</p>
         )}
 
-        {!docsLoading && !docsError && docs.length === 0 && (
+        {!docsLoading && !docsError && sortedDocs.length === 0 && (
           <p className="text-sm text-slate-400">
             No parsed documents yet. Run the seeding script or upload a PDF.
           </p>
         )}
 
-        {!docsLoading && !docsError && docs.length > 0 && (
+        {!docsLoading && !docsError && sortedDocs.length > 0 && (
           <div className="overflow-x-auto rounded-xl border border-slate-700">
             <table className="min-w-full text-sm">
               <thead className="bg-slate-900/60">
                 <tr>
-                  <th className="px-4 py-2 text-left">Title</th>
-                  <th className="px-4 py-2 text-left">Subcommittee</th>
-                  <th className="px-4 py-2 text-left">FY</th>
-                  <th className="px-4 py-2 text-left">Parsed At</th>
+                  <th
+                    className="px-4 py-2 text-left cursor-pointer select-none"
+                    onClick={() => handleSort("title")}
+                  >
+                    Title{sortIndicator("title")}
+                  </th>
+                  <th
+                    className="px-4 py-2 text-left cursor-pointer select-none"
+                    onClick={() => handleSort("subcommittee")}
+                  >
+                    Subcommittee{sortIndicator("subcommittee")}
+                  </th>
+                  <th
+                    className="px-4 py-2 text-left cursor-pointer select-none"
+                    onClick={() => handleSort("fy")}
+                  >
+                    Fiscal Year{sortIndicator("fy")}
+                  </th>
+                  {/* <th className="px-4 py-2 text-left">Parsed At</th> */}
                   <th className="px-4 py-2 text-right">Actions</th>
                 </tr>
               </thead>
               <tbody>
-                {docs.map((f) => {
+                {sortedDocs.map((f) => {
                   const isSelected =
                     firstCompare && firstCompare.table_id === f.table_id;
 
@@ -220,9 +285,9 @@ export default function Page() {
                       <td className="px-3 py-2 text-xs text-slate-300">
                         {f.fy ?? "—"}
                       </td>
-                      <td className="px-3 py-2 text-xs text-slate-300">
+                      {/* <td className="px-3 py-2 text-xs text-slate-300">
                         {formatDateTime(f.file_created_at)}
-                      </td>
+                      </td> */}
                       <td className="px-3 py-2 text-right space-x-2">
                         <Link
                           href={`/tables/${f.table_id}`}
@@ -233,7 +298,7 @@ export default function Page() {
                         <button
                           type="button"
                           onClick={() => handleCompareClick(f)}
-                          className="inline-block rounded-lg border border-blue-600 px-2 py-1 text-xs hover:bg-blue-500 hover:text-white disabled:opacity-40"
+                          className="inline-block rounded-lg border border-blue-600 px-2 py-1 text-xs hover:bg-blue-500 hover:text-white disabled:opacity-40 cursor-pointer"
                           disabled={!f.table_id}
                         >
                           {isSelected ? "Selected…" : "Compare"}
