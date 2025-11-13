@@ -1,13 +1,24 @@
 "use client";
+
 import Link from "next/link";
 import React, { useEffect, useState } from "react";
+import { useRouter } from "next/navigation";
 
 type LatestTable = {
   table_id: string;
+  file_id: string;
   file_name: string;
   table_label: string;
-  created_at: string;
+  file_created_at: string;
+  table_created_at: string;
 };
+
+function formatDateTime(iso: string | null | undefined) {
+  if (!iso) return "—";
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString();
+}
 
 export default function Page() {
   const [status, setStatus] = useState<string>("checking...");
@@ -15,10 +26,23 @@ export default function Page() {
   const [docsError, setDocsError] = useState<string | null>(null);
   const [docsLoading, setDocsLoading] = useState<boolean>(true);
 
+  const [firstCompareId, setFirstCompareId] = useState<string | null>(null);
+  const [firstCompareLabel, setFirstCompareLabel] = useState<string | null>(
+    null
+  );
+  const [compareLoading, setCompareLoading] = useState(false);
+  const [compareError, setCompareError] = useState<string | null>(null);
+
+  const router = useRouter();
   const links = [{ href: "/upload", label: "Upload" }];
 
   useEffect(() => {
-    fetch(`${process.env.NEXT_PUBLIC_API_URL}/health`)
+    const base = process.env.NEXT_PUBLIC_API_URL;
+    if (!base) {
+      setStatus("API URL not configured");
+      return;
+    }
+    fetch(`${base}/health`)
       .then((r) => r.json())
       .then((j) => setStatus(j.status ?? "unknown"))
       .catch(() => setStatus("down"));
@@ -32,6 +56,7 @@ export default function Page() {
       return;
     }
 
+    setDocsLoading(true);
     fetch(`${base}/tables/latest`)
       .then((r) => {
         if (!r.ok) throw new Error("failed");
@@ -47,7 +72,65 @@ export default function Page() {
       });
   }, []);
 
-  console.log("docs ===> ", docs);
+  async function createDiff(prevTableId: string, currTableId: string) {
+    const base = process.env.NEXT_PUBLIC_API_URL;
+    if (!base) {
+      setCompareError("API URL not configured");
+      return;
+    }
+
+    try {
+      setCompareLoading(true);
+      setCompareError(null);
+
+      const res = await fetch(`${base}/diff`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          prev_table_id: prevTableId,
+          curr_table_id: currTableId,
+        }),
+      });
+
+      if (!res.ok) {
+        const msg = await res.text();
+        throw new Error(msg || "diff failed");
+      }
+
+      const { diff_id } = await res.json();
+      router.push(`/diff/${diff_id}`);
+    } catch (e) {
+      console.error("diff failed", e);
+      setCompareError("Failed to create diff");
+    } finally {
+      setCompareLoading(false);
+    }
+  }
+
+  async function handleCompareClick(doc: LatestTable) {
+    if (!doc.table_id) return;
+
+    // first selection
+    if (!firstCompareId) {
+      setFirstCompareId(doc.table_id);
+      setFirstCompareLabel(doc.file_name);
+      setCompareError(null);
+      return;
+    }
+
+    // clicking the same again cancels
+    if (firstCompareId === doc.table_id) {
+      setFirstCompareId(null);
+      setFirstCompareLabel(null);
+      setCompareError(null);
+      return;
+    }
+
+    // second selection → create diff
+    await createDiff(firstCompareId, doc.table_id);
+    setFirstCompareId(null);
+    setFirstCompareLabel(null);
+  }
 
   return (
     <main className="p-6">
@@ -76,6 +159,19 @@ export default function Page() {
       <section className="mt-4">
         <h2 className="text-xl font-semibold mb-3">Latest Budget Documents</h2>
 
+        {firstCompareId && (
+          <p className="text-xs text-slate-300 mb-2">
+            Selected first document:{" "}
+            <span className="font-mono">{firstCompareLabel}</span>. Click
+            “Compare” on another document to create a diff. Click “Compare” on
+            the same row again to clear.
+          </p>
+        )}
+
+        {compareError && (
+          <p className="text-xs text-red-400 mb-2">{compareError}</p>
+        )}
+
         {docsLoading && <p className="text-sm text-slate-400">Loading…</p>}
         {docsError && (
           <p className="text-sm text-red-400">Error: {docsError}</p>
@@ -99,33 +195,44 @@ export default function Page() {
                 </tr>
               </thead>
               <tbody>
-                {docs.map((doc) => (
-                  <tr
-                    key={doc.table_id}
-                    className="border-t border-slate-800 hover:bg-slate-800/50"
-                  >
-                    <td className="px-4 py-2">{doc.file_name}</td>
-                    <td className="px-4 py-2">{doc.table_label}</td>
-                    <td className="px-4 py-2 text-xs text-slate-400">
-                      {new Date(doc.created_at).toLocaleString()}
-                    </td>
-                    <td className="px-4 py-2 text-right space-x-2">
-                      <Link
-                        href={`/tables/${doc.table_id}`}
-                        className="inline-block rounded-lg border border-slate-500 px-3 py-1 text-xs hover:bg-slate-200 hover:text-slate-900"
-                      >
-                        View
-                      </Link>
-                      {/* Compare will need more wiring later */}
-                      <button
-                        className="inline-block rounded-lg border border-slate-700 px-3 py-1 text-xs text-slate-400 cursor-not-allowed"
-                        title="Compare: coming soon"
-                      >
-                        Compare
-                      </button>
-                    </td>
-                  </tr>
-                ))}
+                {docs.map((f) => {
+                  const isSelected =
+                    firstCompareId && firstCompareId === f.table_id;
+                  return (
+                    <tr
+                      key={f.table_id}
+                      className={`border-t border-slate-800 ${
+                        isSelected ? "bg-slate-800/60" : "hover:bg-slate-800/40"
+                      }`}
+                    >
+                      <td className="px-3 py-2">{f.file_name}</td>
+                      <td className="px-3 py-2 text-xs text-slate-300">
+                        {f.table_label || "—"}
+                      </td>
+                      <td className="px-3 py-2 text-xs text-slate-300">
+                        {formatDateTime(f.table_created_at)}
+                      </td>
+                      <td className="px-3 py-2 text-right space-x-2">
+                        {f.table_id && (
+                          <Link
+                            href={`/tables/${f.table_id}`}
+                            className="inline-block rounded-lg border border-slate-700 px-2 py-1 text-xs hover:bg-slate-200 hover:text-slate-900"
+                          >
+                            View
+                          </Link>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => handleCompareClick(f)}
+                          className="inline-block rounded-lg border border-blue-600 px-2 py-1 text-xs hover:bg-blue-500 hover:text-white disabled:opacity-40"
+                          disabled={!f.table_id || compareLoading}
+                        >
+                          {isSelected ? "Selected…" : "Compare"}
+                        </button>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

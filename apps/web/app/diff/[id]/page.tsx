@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useParams } from "next/navigation";
+import Link from "next/link";
 
 const API = process.env.NEXT_PUBLIC_API_URL as string;
 if (!API) {
@@ -81,8 +82,15 @@ export default function DiffPage() {
 
   return (
     <main className="p-6 max-w-5xl mx-auto space-y-4">
-      <h1 className="text-2xl font-semibold mb-2">Differences</h1>
-
+      <div className="flex items-center justify-between mb-2">
+        <h1 className="text-2xl font-semibold mb-2">Differences</h1>
+        <Link
+          href="/"
+          className="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600"
+        >
+          ← Back to documents
+        </Link>
+      </div>
       <div className="flex items-center gap-4 text-sm">
         <span>Filter:</span>
         <select
