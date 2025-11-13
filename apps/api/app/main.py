@@ -1,7 +1,7 @@
 import os, hashlib, tempfile, os as _os, json
 from contextlib import asynccontextmanager
 import asyncpg
-from fastapi import FastAPI, UploadFile, File as F, Depends, HTTPException
+from fastapi import FastAPI, UploadFile, File as F, Depends, HTTPException, Response
 from fastapi.responses import JSONResponse
 from app.storage import s3, BUCKET, ensure_bucket
 from pydantic import BaseModel
@@ -13,6 +13,9 @@ import pdfplumber
 import tempfile
 from decimal import Decimal
 from typing import Any, List, Optional
+import io, csv
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
 
 load_dotenv()
 
@@ -598,6 +601,181 @@ async def render_cell(body: RenderIn, db=Depends(get_db)):
     )
 
     return {"url": url}
+
+@app.get("/export/csv")
+async def export_csv(diff_id: str, db=Depends(get_db)):
+    # Query diff rows for the given diff_id, including program_id if available
+    rows = await db.fetch(
+        """
+        SELECT 
+          COALESCE(rp.program_id, rc.program_id) AS program_id,
+          dr.program_name,
+          dr.prev_amount,
+          dr.curr_amount,
+          dr.delta_abs,
+          dr.delta_pct
+        FROM diff_rows dr
+        JOIN diffs d ON dr.diff_id = d.id
+        LEFT JOIN rows rp 
+          ON rp.table_id = d.prev_table_id AND rp.program_name = dr.program_name
+        LEFT JOIN rows rc 
+          ON rc.table_id = d.curr_table_id AND rc.program_name = dr.program_name
+        WHERE dr.diff_id = $1::uuid
+        """,
+        diff_id,
+    )
+    if not rows:
+        raise HTTPException(status_code=404, detail="Diff not found or no data")
+    # Write CSV to an in-memory buffer
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow(["program_id", "name", "prev", "curr", "delta_abs", "delta_pct"])
+    for r in rows:
+        writer.writerow([
+            r["program_id"] or "",       # use empty string if None
+            r["program_name"],
+            r["prev_amount"] if r["prev_amount"] is not None else "",
+            r["curr_amount"] if r["curr_amount"] is not None else "",
+            r["delta_abs"] if r["delta_abs"] is not None else "",
+            r["delta_pct"] if r["delta_pct"] is not None else ""
+        ])
+    csv_data = output.getvalue()
+    output.close()
+    # Return CSV file response
+    filename = f"diff_{diff_id}.csv"
+    return Response(content=csv_data, media_type="text/csv",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+
+@app.get("/brief/pdf")
+async def brief_pdf(diff_id: str, db=Depends(get_db)):
+    # Query top 5 increases and top 5 cuts for the diff
+    # (largest positive delta_abs and largest negative delta_abs)
+    incs = await db.fetch(
+        """
+        SELECT dr.program_name, dr.prev_amount, dr.curr_amount, dr.delta_abs, dr.delta_pct,
+               pf.name AS prev_file, rp.page AS prev_page, rp.checksum AS prev_checksum,
+               cf.name AS curr_file, rc.page AS curr_page, rc.checksum AS curr_checksum
+        FROM diff_rows dr
+        JOIN diffs d ON dr.diff_id = d.id
+        LEFT JOIN rows rp ON rp.table_id = d.prev_table_id AND rp.program_name = dr.program_name
+        LEFT JOIN tables tp ON rp.table_id = tp.id
+        LEFT JOIN files pf ON tp.file_id = pf.id
+        LEFT JOIN rows rc ON rc.table_id = d.curr_table_id AND rc.program_name = dr.program_name
+        LEFT JOIN tables tc ON rc.table_id = tc.id
+        LEFT JOIN files cf ON tc.file_id = cf.id
+        WHERE dr.diff_id = $1::uuid AND dr.delta_abs > 0
+        ORDER BY dr.delta_abs DESC
+        LIMIT 5;
+        """,
+        diff_id,
+    )
+    cuts = await db.fetch(
+        """
+        SELECT dr.program_name, dr.prev_amount, dr.curr_amount, dr.delta_abs, dr.delta_pct,
+               pf.name AS prev_file, rp.page AS prev_page, rp.checksum AS prev_checksum,
+               cf.name AS curr_file, rc.page AS curr_page, rc.checksum AS curr_checksum
+        FROM diff_rows dr
+        JOIN diffs d ON dr.diff_id = d.id
+        LEFT JOIN rows rp ON rp.table_id = d.prev_table_id AND rp.program_name = dr.program_name
+        LEFT JOIN tables tp ON rp.table_id = tp.id
+        LEFT JOIN files pf ON tp.file_id = pf.id
+        LEFT JOIN rows rc ON rc.table_id = d.curr_table_id AND rc.program_name = dr.program_name
+        LEFT JOIN tables tc ON rc.table_id = tc.id
+        LEFT JOIN files cf ON tc.file_id = cf.id
+        WHERE dr.diff_id = $1::uuid AND dr.delta_abs < 0
+        ORDER BY dr.delta_abs ASC
+        LIMIT 5;
+        """,
+        diff_id,
+    )
+    if not incs and not cuts:
+        raise HTTPException(status_code=404, detail="No differences found for this diff")
+    # Set up PDF canvas
+    buffer = io.BytesIO()
+    pdf = canvas.Canvas(buffer, pagesize=letter)
+    width, height = letter  # 612x792 points for letter size
+
+    text_y = height - 50  # start 50 points from top
+    pdf.setFont("Helvetica-Bold", 14)
+    pdf.drawString(50, text_y, "Top Increases")
+    text_y -= 20
+    pdf.setFont("Helvetica", 11)
+    if incs:
+        for row in incs:
+            # Example line: Program Name: prev -> curr ( +delta_abs, +delta_pct% )
+            name = row["program_name"] or "Unnamed Program"
+            prev = row["prev_amount"]
+            curr = row["curr_amount"]
+            delta_abs = row["delta_abs"]
+            delta_pct = row["delta_pct"]
+            # Format values for display (use comma separators for amounts, one decimal for pct)
+            prev_str = f"{prev:,}" if prev is not None else "—"
+            curr_str = f"{curr:,}" if curr is not None else "—"
+            # delta_abs sign and formatting
+            sign = "+" if delta_abs and delta_abs > 0 else ""
+            delta_abs_str = f"{sign}{delta_abs:,}" if delta_abs is not None else "0"
+            delta_pct_str = f"({sign}{delta_pct:.1f}%)" if delta_pct is not None else ""
+            line = f"{name}: {prev_str} → {curr_str}   ({delta_abs_str} {delta_pct_str})"
+            pdf.drawString(70, text_y, line)
+            text_y -= 15
+    else:
+        pdf.drawString(70, text_y, "None")
+        text_y -= 15
+
+    # Top Cuts section
+    text_y -= 10  # small gap before next section
+    pdf.setFont("Helvetica-Bold", 14)
+    pdf.drawString(50, text_y, "Top Cuts")
+    text_y -= 20
+    pdf.setFont("Helvetica", 11)
+    if cuts:
+        for row in cuts:
+            name = row["program_name"] or "Unnamed Program"
+            prev = row["prev_amount"]
+            curr = row["curr_amount"]
+            delta_abs = row["delta_abs"]
+            delta_pct = row["delta_pct"]
+            prev_str = f"{prev:,}" if prev is not None else "—"
+            curr_str = f"{curr:,}" if curr is not None else "—"
+            # For cuts, delta_abs will be negative
+            sign = "-" if delta_abs and delta_abs < 0 else ""
+            delta_abs_str = f"{delta_abs:,}" if delta_abs is not None else "0"
+            delta_pct_str = f"({delta_pct:.1f}%)" if delta_pct is not None else ""
+            line = f"{name}: {prev_str} → {curr_str}   ({delta_abs_str} {delta_pct_str})"
+            pdf.drawString(70, text_y, line)
+            text_y -= 15
+    else:
+        pdf.drawString(70, text_y, "None")
+        text_y -= 15
+
+    # Footer with sources
+    text_y -= 10
+    pdf.setFont("Helvetica-Oblique", 10)
+    pdf.drawString(50, text_y, "Sources:")
+    text_y -= 14
+    pdf.setFont("Helvetica", 9)
+    # List each program's sources (file name, page, checksum)
+    for row in list(incs) + list(cuts):
+        name = row["program_name"] or "Unnamed Program"
+        # Previous source (if exists)
+        if row["prev_amount"] is not None and row["prev_file"]:
+            prev_src = f"Prev source for '{name}': {row['prev_file']} p.{row['prev_page']} (checksum {row['prev_checksum']})"
+            pdf.drawString(60, text_y, prev_src)
+            text_y -= 12
+        # Current source (if exists)
+        if row["curr_amount"] is not None and row["curr_file"]:
+            curr_src = f"Curr source for '{name}': {row['curr_file']} p.{row['curr_page']} (checksum {row['curr_checksum']})"
+            pdf.drawString(60, text_y, curr_src)
+            text_y -= 12
+    # Finalize PDF
+    pdf.showPage()
+    pdf.save()
+    pdf_bytes = buffer.getvalue()
+    buffer.close()
+    # Return PDF response
+    filename = f"brief_{diff_id}.pdf"
+    return Response(content=pdf_bytes, media_type="application/pdf",
+                    headers={"Content-Disposition": f'attachment; filename=\"{filename}\"'})
 
 
 @app.get("/health")

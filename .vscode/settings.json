@@ -10,10 +10,13 @@
     "minioadmin",
     "mult",
     "ossp",
+    "pagesizes",
+    "pdfgen",
     "pdfplumber",
     "pidx",
     "presign",
     "pydantic",
+    "reportlab",
     "tailwindcss",
     "TIMESTAMPTZ"
   ]

@@ -95,6 +95,25 @@ export default function DiffPage() {
           <option value="cuts">Cuts only</option>
         </select>
       </div>
+      <div className="flex gap-4 my-2">
+        {/* Export CSV link */}
+        <a
+          href={`${API}/export/csv?diff_id=${diffId}`}
+          className="text-xs px-3 py-2 rounded bg-slate-700 hover:bg-slate-600"
+          download={`diff_${diffId}.csv`}
+        >
+          Export CSV
+        </a>
+        {/* Print Brief link */}
+        <a
+          href={`${API}/brief/pdf?diff_id=${diffId}`}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-xs px-3 py-2 rounded bg-slate-700 hover:bg-slate-600"
+        >
+          Print Brief (PDF)
+        </a>
+      </div>
 
       {loading && <p className="text-slate-300 text-sm">Loading diff…</p>}
 
@@ -145,11 +164,11 @@ export default function DiffPage() {
       )}
       {renderingRowId && (
         <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
-          <div className="bg-slate-900 rounded-lg p-4 max-w-3xl w-full max-h-[90vh] flex flex-col">
+          <div className="bg-slate-900 border-2 border-slate-300 rounded-lg p-4 max-w-3xl w-full max-h-[90vh] flex flex-col">
             <div className="flex justify-between items-center mb-2">
               <h2 className="text-sm font-semibold">Source highlight</h2>
               <button
-                className="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600"
+                className="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 cursor-pointer"
                 onClick={() => {
                   setRenderingRowId(null);
                   setRenderUrl(null);

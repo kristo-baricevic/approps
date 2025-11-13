@@ -26,7 +26,7 @@ export default function Page() {
           <ul className="flex sm:space-x-4 justify-center">
             {links.map((link) => (
               <li
-                className="hover:bg-blue-300 sm:px-4 p-2 text-xs sm:text-base"
+                className="hover:bg-blue-300 hover:text-slate-700 hover:rounded-lg sm:px-4 p-2 text-xs sm:text-base"
                 key={link.href}
               >
                 <Link href={link.href}>
