@@ -34,6 +34,7 @@ services:
 
   api:
     build: ./apps/api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     depends_on:
       db:
         condition: service_healthy
@@ -49,21 +50,6 @@ services:
       - "8000:8000"
     volumes:
       - ./apps/api:/app
-
-  # web:
-  #   build: ./apps/web
-  #   depends_on:
-  #     api:
-  #       condition: service_started
-  #   environment:
-  #     NEXT_PUBLIC_API_BASE_URL: http://localhost:8000
-  #     PORT: 3000
-  #   ports:
-  #     - "3000:3000"
-  #   volumes:
-  #     - ./apps/web:/usr/src/app
-  #     - /usr/src/app/node_modules
-  #   command: ["npm","run","dev"]
 
 volumes:
   pgdata:
