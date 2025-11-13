@@ -7,7 +7,7 @@ from app.storage import s3, BUCKET, ensure_bucket
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
-from app.parser import download_file_to_tmp, parse_pdf_to_rows_combined, parse_pdf_to_rows, md5_row
+from app.parser import download_file_to_tmp, get_program_id, parse_pdf_to_rows_combined, parse_pdf_to_rows, md5_row
 import re
 import pdfplumber
 import tempfile
@@ -306,14 +306,25 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
         rows = clean_rows
 
         for r in rows:
-            checksum = md5_row(r["program_name"], r["fy"], r["amount"], r["page"])
+            name = r["program_name"]
+            program_id = get_program_id(name)
+
+            checksum = md5_row(name, r["fy"], r["amount"], r["page"])
             bbox_val = r.get("bbox")
             bbox_json = json.dumps(bbox_val) if bbox_val else None
+
             await db.execute(
                 """INSERT INTO rows (table_id, program_id, program_name, fy, amount, bbox, page, checksum)
                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
                 ON CONFLICT (table_id, checksum) DO NOTHING""",
-                table_id, None, r["program_name"], r["fy"], r["amount"], bbox_json, r["page"], checksum
+                table_id,
+                program_id,
+                name,
+                r["fy"],
+                r["amount"],
+                bbox_json,
+                r["page"],
+                checksum,
             )
 
         audit = await audit_table(str(table_id), db)
@@ -394,37 +405,43 @@ async def create_diff(diff_in: DiffIn, db=Depends(get_db)):
     await db.execute(
         """
         WITH prev AS (
-          SELECT program_name, amount AS prev_amount
-          FROM rows
-          WHERE table_id = $1::uuid
+        SELECT
+            COALESCE(program_id, program_name) AS program_key,
+            program_name,
+            amount AS prev_amount
+        FROM rows
+        WHERE table_id = $1::uuid
         ),
         curr AS (
-          SELECT program_name, amount AS curr_amount
-          FROM rows
-          WHERE table_id = $2::uuid
+        SELECT
+            COALESCE(program_id, program_name) AS program_key,
+            program_name,
+            amount AS curr_amount
+        FROM rows
+        WHERE table_id = $2::uuid
         ),
         joined AS (
-          SELECT
+        SELECT
             COALESCE(p.program_name, c.program_name) AS program_name,
             p.prev_amount,
             c.curr_amount
-          FROM prev p
-          FULL OUTER JOIN curr c
-            ON p.program_name = c.program_name
+        FROM prev p
+        FULL OUTER JOIN curr c
+            ON p.program_key = c.program_key
         )
         INSERT INTO diff_rows (
-          diff_id, program_name, prev_amount, curr_amount, delta_abs, delta_pct
+        diff_id, program_name, prev_amount, curr_amount, delta_abs, delta_pct
         )
         SELECT
-          $3::uuid,
-          program_name,
-          prev_amount,
-          curr_amount,
-          COALESCE(curr_amount, 0) - COALESCE(prev_amount, 0) AS delta_abs,
-          CASE
+        $3::uuid,
+        program_name,
+        prev_amount,
+        curr_amount,
+        COALESCE(curr_amount, 0) - COALESCE(prev_amount, 0) AS delta_abs,
+        CASE
             WHEN prev_amount IS NULL OR prev_amount = 0 THEN NULL
             ELSE ((COALESCE(curr_amount, 0) - prev_amount)::double precision / prev_amount) * 100.0
-          END AS delta_pct
+        END AS delta_pct
         FROM joined
         WHERE prev_amount IS NOT NULL OR curr_amount IS NOT NULL
         """,
@@ -432,6 +449,7 @@ async def create_diff(diff_in: DiffIn, db=Depends(get_db)):
         curr_id,
         diff_id,
     )
+
 
     return {"diff_id": str(diff_id)}
 

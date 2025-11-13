@@ -7,17 +7,25 @@
     "ctid",
     "dotenv",
     "fetchrow",
+    "headstart",
+    "HRSA",
+    "jobcorps",
+    "LIHEAP",
     "minioadmin",
     "mult",
     "ossp",
     "pagesizes",
     "pdfgen",
     "pdfplumber",
+    "Pell",
     "pidx",
     "presign",
     "pydantic",
     "reportlab",
+    "SAMHSA",
     "tailwindcss",
-    "TIMESTAMPTZ"
+    "TANF",
+    "TIMESTAMPTZ",
+    "wioa"
   ]
 }

@@ -5,6 +5,7 @@ from typing import Optional, Tuple, Any, List, Dict
 from app.storage import s3
 from botocore.exceptions import ClientError
 from fastapi import HTTPException
+import camelot
 
 NUM_RE = re.compile(r"\(?\$?\s*[\d,]+(?:\.\d{1,2})?\)?")
 FY_RE  = re.compile(r"\bFY\s*([12]\d{3})\b", re.I)
@@ -22,6 +23,107 @@ AMT_RE = re.compile(
 NEG_CUES = re.compile(r"\b(cut|cuts|decrease|decreases|reduction|reduces|below|(-|\u2013) ?less)\b", re.I)
 IS_YEAR = re.compile(r"\b(19|20)\d{2}\b")  # 1900–2099
 IS_EO_ID = re.compile(r"\b14\d{2,}\b")     # e.g., 14173, 14321 etc.
+
+# --- Program ID aliasing / normalization ---
+
+# MVP alias map: fill this out over time.
+PROGRAM_ALIAS_MAP: dict[str, str] = {
+    "centers for disease control and prevention": "HHS_CDC",
+    "centers for disease control": "HHS_CDC",
+    "cdc": "HHS_CDC",
+    "cdc programs": "HHS_CDC",
+
+    "national institutes of health": "HHS_NIH",
+    "nih": "HHS_NIH",
+    "nih research": "HHS_NIH",
+
+    "health resources and services administration": "HHS_HRSA",
+    "hrsa": "HHS_HRSA",
+
+    "substance abuse and mental health services administration": "HHS_SAMHSA",
+    "samhsa": "HHS_SAMHSA",
+
+    "administration for children and families": "HHS_ACF",
+    "acf": "HHS_ACF",
+
+    "head start": "HHS_ACF_HeadStart",
+    "head start program": "HHS_ACF_HeadStart",
+    "headstart": "HHS_ACF_HeadStart",
+    "early head start": "HHS_ACF_HeadStart",
+
+    "low income home energy assistance program": "HHS_LIHEAP",
+    "liheap": "HHS_LIHEAP",
+    "home energy assistance": "HHS_LIHEAP",
+
+    "community health centers": "HHS_CHC",
+    "community health center program": "HHS_CHC",
+    "federally qualified health centers": "HHS_CHC",
+
+    "department of education": "ED_Department",
+    "education department": "ED_Department",
+
+    "title i grants to local educational agencies": "ED_TitleI_LEA",
+    "title i grants to leas": "ED_TitleI_LEA",
+    "title i": "ED_TitleI_LEA",
+
+    "special education grants to states": "ED_IDEA_B",
+    "idea part b grants to states": "ED_IDEA_B",
+    "idea part b": "ED_IDEA_B",
+
+    "federal pell grants": "ED_Pell",
+    "pell grants": "ED_Pell",
+    "pell grant program": "ED_Pell",
+
+    "workforce innovation and opportunity act youth activities": "DOL_WIOA_Youth",
+    "wioa youth activities": "DOL_WIOA_Youth",
+    "youth training activities": "DOL_WIOA_Youth",
+
+    "workforce innovation and opportunity act adult activities": "DOL_WIOA_Adult",
+    "wioa adult activities": "DOL_WIOA_Adult",
+    "adult training activities": "DOL_WIOA_Adult",
+
+    "job corps": "DOL_JobCorps",
+    "jobcorps": "DOL_JobCorps",
+
+    "supplemental nutrition assistance program": "USDA_SNAP",
+    "snap": "USDA_SNAP",
+    "food stamp program": "USDA_SNAP",
+
+    "special supplemental nutrition program for women infants and children": "USDA_WIC",
+    "wic": "USDA_WIC",
+
+    "temporary assistance for needy families": "HHS_TANF",
+    "tanf": "HHS_TANF",
+
+    "housing choice vouchers": "HUD_HCV",
+    "housing choice voucher program": "HUD_HCV",
+    "section 8 housing choice vouchers": "HUD_HCV",
+
+    "public housing fund": "HUD_PublicHousing",
+    "public housing capital fund": "HUD_PublicHousing",
+    "public housing operating fund": "HUD_PublicHousing",
+}
+
+
+def normalize_program_name_for_id(name: str) -> str:
+    if not name:
+        return ""
+    s = name.lower()
+    s = re.sub(r"&", "and", s)
+    s = re.sub(r"[^a-z0-9\s]", "", s)   # drop punctuation
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def get_program_id(raw_name: str) -> str:
+    """
+    Normalize a program name and map to a stable ID.
+    If we don't know it yet, just use the normalized name itself as the ID.
+    """
+    norm = normalize_program_name_for_id(raw_name)
+    if not norm:
+        return ""
+    return PROGRAM_ALIAS_MAP.get(norm, norm)
+
 
 def to_whole_dollars(num_str: str, unit: Optional[str], had_dollar_prefix: bool) -> Optional[int]:
     if not num_str or not re.search(r"\d", num_str):
@@ -70,6 +172,33 @@ def extract_program_phrase(line: str) -> str:
     # keep it readable but short
     return frag[:160]
 
+def extract_tables_with_camelot(local_path: str, page_number: int) -> List[List[List[str]]]:
+    """
+    Use Camelot to extract tables from a single page.
+    Returns a list of tables, where each table is a list of rows,
+    and each row is a list of strings, matching the shape expected by parse_pdf_to_rows.
+    """
+    try:
+        camelot_tables = camelot.read_pdf(
+            local_path,
+            pages=str(page_number),
+            flavor="lattice",  # good first guess for gov/appropriations docs
+        )
+    except Exception:
+        return []
+
+    tables: List[List[List[str]]] = []
+    for table in camelot_tables:
+        df = table.df  # pandas DataFrame
+        # Convert DataFrame to list-of-lists of strings
+        tbl: List[List[str]] = []
+        for row in df.itertuples(index=False):
+            cells = [str(cell).strip() if cell is not None else "" for cell in row]
+            tbl.append(cells)
+        if tbl:
+            tables.append(tbl)
+
+    return tables
 
 def s3_url_to_bucket_key(stored_url: str) -> Tuple[str, str]:
     # s3://<bucket>/<key>
@@ -199,6 +328,11 @@ def parse_pdf_to_rows(local_path: str) -> list[dict]:
                 if t:
                     tables = t
                     break
+
+            if not tables:
+                camelot_tables = extract_tables_with_camelot(local_path, pidx)
+                tables = camelot_tables
+
             if not tables:
                 continue
 
