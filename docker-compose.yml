@@ -35,6 +35,8 @@ services:
   api:
     build: ./apps/api
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
     depends_on:
       db:
         condition: service_healthy
@@ -51,7 +53,7 @@ services:
       S3_ACCESS_KEY: ${MINIO_ROOT_USER}
       S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
       PORT: 8000
-
+      
 volumes:
   pgdata:
   minio:
