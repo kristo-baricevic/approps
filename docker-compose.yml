@@ -45,6 +45,7 @@ services:
       MINIO_ENDPOINT: http://minio:9000
       MINIO_ACCESS_KEY: ${MINIO_ROOT_USER}
       MINIO_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      S3_ENDPOINT_URL: http://minio:9000
       PORT: 8000
     ports:
       - "8000:8000"
