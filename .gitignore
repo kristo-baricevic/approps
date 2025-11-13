@@ -11,3 +11,7 @@ apps/api/.venv/
 # macOS
 .DS_Store
 README
+.minio-data/
+__pycache__/
+*.py[cod]
+.vscode/
