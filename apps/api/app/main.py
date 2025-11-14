@@ -191,7 +191,8 @@ async def presign_put_endpoint(body: PresignIn):
         Params={"Bucket": BUCKET, "Key": key, "ContentType": body.content_type},
         ExpiresIn=3600,
     )
-    return {"url": put_url, "key": key}
+    external_url = put_url.replace("http://minio:9000", "https://api-approps.com")
+    return {"url": external_url, "key": key}
 
 class RegisterIn(BaseModel):
     sha256: str
