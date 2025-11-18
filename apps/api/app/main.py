@@ -18,6 +18,7 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from botocore.exceptions import ClientError
 from openai import AsyncOpenAI
+from urllib.parse import unquote
 
 load_dotenv()
 
@@ -48,6 +49,8 @@ GENERIC_PROGRAM_RE = re.compile(
 
 
 def needs_ai_refinement(name: str) -> bool:
+    print("AI CALL:", name)
+
     if not name:
         return False
     s = name.strip().lower()
@@ -64,13 +67,19 @@ async def call_ai_for_program(
     fy: int | None,
     file_label: str,
 ) -> tuple[str, str]:
-    if not AI_ENABLED or not context:
+    # If AI is disabled or we have no context, bail early
+    if not AI_ENABLED:
+        print("AI disabled: OPENAI_API_KEY not set")
+        return "", ""
+    if not context or not context.strip():
+        print("AI skipped: empty context")
         return "", ""
 
     system_msg = (
         "You are helping label budget line items from US appropriations explanatory statements. "
         "Given a short excerpt, identify the specific program or activity being funded and write "
-        "a short human readable description. Keep the name concise and the description brief."
+        "a short human readable description. Keep the name concise and the description brief. "
+        "Respond ONLY with a JSON object with keys 'name' and 'brief'."
     )
 
     user_msg = f"""
@@ -96,11 +105,30 @@ Return JSON with keys "name" and "brief". Example:
             max_tokens=200,
         )
         content = resp.choices[0].message.content or ""
-        data = json.loads(content)
+        print("AI raw content:", content)
+
+        # Try to isolate the JSON payload in case the model wraps it in text
+        start = content.find("{")
+        end = content.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            print("AI parse error: could not find JSON braces in content")
+            return "", ""
+
+        json_str = content[start : end + 1]
+        try:
+            data = json.loads(json_str)
+        except Exception as e:
+            print("AI json.loads error:", repr(e), "json_str:", json_str)
+            return "", ""
+
         name = (data.get("name") or "").strip()
         brief = (data.get("brief") or "").strip()
+        print("AI parsed name/brief:", repr(name), repr(brief))
         return name, brief
-    except Exception:
+    except Exception as e:
+        import traceback
+        print("AI call failed:", repr(e))
+        traceback.print_exc()
         return "", ""
 
 
@@ -361,40 +389,54 @@ async def audit_table(table_id: str, db: asyncpg.Connection) -> dict:
     return {"passed": passed, "messages": messages}
 
 
-class ParseIn(BaseModel):
-    file_id: str
-    table_label: str
 
 
 class ParseIn(BaseModel):
-    file_id: str
+    file_id: str | None = None
     table_label: str
 
 
 @app.post("/parse")
 async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
+    print("calling parse: begin")
+
     try:
-        # select id, stored_url, name so we can use file_name later
-        frow = await db.fetchrow(
-            "SELECT id, stored_url, name FROM files WHERE id=$1::uuid",
-            body.file_id,
-        )
+        # 1) Load file, either by explicit id or by filename in table_label
+        if body.file_id:
+            frow = await db.fetchrow(
+                "SELECT id, name, stored_url FROM files WHERE id = $1::uuid",
+                body.file_id,
+            )
+        else:
+            filename = unquote(body.table_label)
+            frow = await db.fetchrow(
+                "SELECT id, name, stored_url FROM files WHERE name = $1",
+                filename,
+            )
+
         if not frow:
             raise HTTPException(404, "file not found")
 
         file_id = frow["id"]
-        file_name = frow["name"]
+        file_name = frow["name"]      # used as context for AI
         stored_url = frow["stored_url"]
 
+        table_label = body.table_label or file_name
+
+        # 2) Create a new table record
         trow = await db.fetchrow(
-            """INSERT INTO tables (file_id, label, parser_version)
-               VALUES ($1,$2,$3) RETURNING id""",
+            """
+            INSERT INTO tables (file_id, label, parser_version)
+            VALUES ($1, $2, $3)
+            RETURNING id
+            """,
             file_id,
-            body.table_label,
+            table_label,
             "v0.1",
         )
         table_id = trow["id"]
 
+        # 3) Download and parse PDF
         tmp = download_file_to_tmp(stored_url)
         try:
             rows = parse_pdf_to_rows_combined(tmp)
@@ -403,7 +445,10 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
                 os.remove(tmp)
             except:
                 pass
+        print("Download and parse PDF complete")
 
+
+        # 4) Initial cleaning of raw rows
         clean_rows = []
 
         for r in rows:
@@ -417,47 +462,51 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
             if len([t for t in re.findall(r"[A-Za-z]+", name) if len(t) >= 2]) < 2:
                 continue
 
-            if r["amount"] is None:
+            if r.get("amount") is None:
                 continue
 
-            # keep both original and cleaned
-            r["program_name_raw"] = raw_name
+            # store the cleaned title back on the row so everything downstream sees it
             r["program_name"] = name
             clean_rows.append(r)
 
         rows = clean_rows
 
+        # 5) Insert rows with optional AI refinement
         for r in rows:
-            raw_program = r.get("program_name_raw") or r.get("program_name") or ""
+            raw_program = r.get("program_name") or ""
             heuristic_name = clean_program_title(raw_program)
+            print(f"heuristic_name is -====- {heuristic_name}")
 
-            # If the cleaned name is not actually a usable program label, skip row
-            if not looks_like_program_name(heuristic_name):
-                continue
+            # If you want to keep an extra guard here, define a simple helper,
+            # or just trust the cleaning above. For now, trust it.
+            # if not looks_like_program_name(heuristic_name):
+            #     continue
 
             program_id = get_program_id(heuristic_name)
 
             checksum = md5_row(
                 heuristic_name,
-                r["fy"],
-                r["amount"],
-                r["page"],
+                r.get("fy"),
+                r.get("amount"),
+                r.get("page"),
             )
 
             bbox_val = r.get("bbox")
-            bbox_json = json.dumps(bbox_val) if bbox_val else None
+            bbox_json = json.dumps(bbox_val) if bbox_val is not None else None
 
             # Default metadata (no AI)
             final_name = heuristic_name
             ai_name: str | None = None
             ai_brief: str | None = None
             name_source = "heuristic"
+            print(f"needs_ai_refinement ---- 000 ")
 
-            # Decide whether this looks generic and should be refined by AI
+            # 5a) Decide whether to send to AI
             if needs_ai_refinement(heuristic_name):
+                print(f"needs_ai_refinement ---- 001 ")
+
                 ai_name_tmp, ai_brief_tmp = await call_ai_for_program(
-                    # use the raw program text as context for now
-                    context=raw_program,
+                    context=heuristic_name,
                     amount=r.get("amount"),
                     fy=r.get("fy"),
                     file_label=file_name,
@@ -468,6 +517,7 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
                     ai_brief = ai_brief_tmp or None
                     name_source = "ai"
 
+            # 5b) Insert (or update) row
             await db.execute(
                 """
                 INSERT INTO rows (
@@ -500,17 +550,18 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
                 """,
                 table_id,
                 program_id,
-                final_name,                   # program_name (final)
-                raw_program or None,          # program_name_raw
-                ai_name,                      # program_ai_name
-                ai_brief,                     # program_ai_brief
-                name_source,                  # program_name_source
-                r["fy"],
-                r["amount"],
+                final_name,
+                raw_program or None,
+                ai_name,
+                ai_brief,
+                name_source,
+                r.get("fy"),
+                r.get("amount"),
                 bbox_json,
-                r["page"],
+                r.get("page"),
                 checksum,
             )
+        print(f"needs_ai_refinement ---- 003 ")
 
         audit = await audit_table(str(table_id), db)
         return {
@@ -1030,7 +1081,11 @@ async def get_table(table_id: str, db=Depends(get_db)):
     # Table metadata
     table = await db.fetchrow(
         """
-        SELECT t.id, t.label, t.created_at, f.name AS file_name
+        SELECT t.id,
+               t.file_id,
+               t.label,
+               t.created_at,
+               f.name AS file_name
         FROM tables t
         JOIN files f ON t.file_id = f.id
         WHERE t.id = $1::uuid
@@ -1041,10 +1096,20 @@ async def get_table(table_id: str, db=Depends(get_db)):
     if not table:
         raise HTTPException(status_code=404, detail="table not found")
 
-    # Table rows
+    # Table rows, now including AI columns
     rows = await db.fetch(
         """
-        SELECT program_name, amount, page, bbox, fy
+        SELECT
+          id,
+          program_name,
+          program_name_raw,
+          program_ai_name,
+          program_ai_brief,
+          program_name_source,
+          amount,
+          page,
+          bbox,
+          fy
         FROM rows
         WHERE table_id = $1::uuid
         ORDER BY page, program_name
@@ -1054,12 +1119,18 @@ async def get_table(table_id: str, db=Depends(get_db)):
 
     return {
         "table_id": str(table["id"]),
+        "file_id": str(table["file_id"]),   # <<< add this
         "file_name": table["file_name"],
         "table_label": table["label"],
         "created_at": table["created_at"].isoformat(),
         "rows": [
             {
+                "row_id": str(r["id"]),
                 "program_name": r["program_name"],
+                "program_name_raw": r["program_name_raw"],
+                "program_ai_name": r["program_ai_name"],
+                "program_ai_brief": r["program_ai_brief"],
+                "program_name_source": r["program_name_source"],
                 "amount": r["amount"],
                 "page": r["page"],
                 "bbox": r["bbox"],
@@ -1068,7 +1139,6 @@ async def get_table(table_id: str, db=Depends(get_db)):
             for r in rows
         ],
     }
-
 
 @app.get("/health")
 def health():

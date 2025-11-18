@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { useParams } from "next/navigation";
+import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 
 type TableRow = {
@@ -14,6 +14,7 @@ type TableRow = {
 
 type TableData = {
   table_id: string;
+  file_id: string;
   file_name: string;
   table_label: string;
   created_at: string;
@@ -22,11 +23,15 @@ type TableData = {
 
 export default function TablePage() {
   const params = useParams();
+  const router = useRouter();
   const tableId = (params?.tableId ?? params?.table_id) as string | undefined;
 
   const [data, setData] = useState<TableData | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [reparseLoading, setReparseLoading] = useState(false);
+
+  const apiBase = process.env.NEXT_PUBLIC_API_URL;
 
   useEffect(() => {
     if (!tableId) {
@@ -35,15 +40,14 @@ export default function TablePage() {
       return;
     }
 
-    const base = process.env.NEXT_PUBLIC_API_URL;
-    if (!base) {
+    if (!apiBase) {
       setError("NEXT_PUBLIC_API_URL not configured");
       setLoading(false);
       return;
     }
 
     setLoading(true);
-    fetch(`${base}/tables/${tableId}`)
+    fetch(`${apiBase}/tables/${tableId}`)
       .then((r) => {
         if (!r.ok) {
           throw new Error(`status ${r.status}`);
@@ -58,11 +62,47 @@ export default function TablePage() {
         setError(`Failed to load table: ${String(e)}`);
         setLoading(false);
       });
-  }, [tableId]);
+  }, [tableId, apiBase]);
 
   const formatAmount = (val: number | null) => {
     if (val === null || val === undefined) return "—";
     return val.toLocaleString("en-US", { maximumFractionDigits: 0 });
+  };
+
+  const handleReparse = async () => {
+    if (!data) return;
+    if (!apiBase) {
+      setError("NEXT_PUBLIC_API_URL not configured");
+      return;
+    }
+
+    setReparseLoading(true);
+    setError(null);
+    console.log("data.file_id", data.file_id);
+    try {
+      const res = await fetch(`${apiBase}/parse`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          file_id: data.file_id,
+          table_label: data.table_label,
+        }),
+      });
+
+      if (!res.ok) {
+        throw new Error(`status ${res.status}`);
+      }
+
+      const out = await res.json(); // { table_id, audit, count }
+      const newTableId = out.table_id as string | undefined;
+      if (newTableId) {
+        router.push(`/tables/${newTableId}`);
+      }
+    } catch (e) {
+      setError(`Failed to reparse table: ${String(e)}`);
+    } finally {
+      setReparseLoading(false);
+    }
   };
 
   return (
@@ -77,12 +117,24 @@ export default function TablePage() {
             </span>
           </p>
         </div>
-        <Link
-          href="/"
-          className="rounded-lg border border-slate-700 px-3 py-1 text-sm hover:bg-slate-200 hover:text-slate-900"
-        >
-          ← Back to Home
-        </Link>
+
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={handleReparse}
+            disabled={reparseLoading || !data}
+            className="rounded-lg border border-slate-700 px-3 py-1 text-sm disabled:opacity-50 hover:bg-slate-200 hover:text-slate-900"
+          >
+            {reparseLoading ? "Reparsing…" : "Reparse table"}
+          </button>
+
+          <Link
+            href="/"
+            className="rounded-lg border border-slate-700 px-3 py-1 text-sm hover:bg-slate-200 hover:text-slate-900"
+          >
+            ← Back to Home
+          </Link>
+        </div>
       </header>
 
       {loading && <p className="text-sm text-slate-400">Loading…</p>}
