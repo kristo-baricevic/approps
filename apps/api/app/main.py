@@ -7,7 +7,7 @@ from app.storage import s3, BUCKET, ensure_bucket
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
-from app.parser import download_file_to_tmp, get_program_id, clean_program_title, parse_pdf_to_rows_combined, parse_pdf_to_rows, md5_row, s3_url_to_bucket_key
+from app.parser import download_file_to_tmp, get_program_id, ai_label_program, looks_like_program_name, clean_program_title, parse_pdf_to_rows_combined, parse_pdf_to_rows, md5_row, s3_url_to_bucket_key
 import re
 import pdfplumber
 import tempfile
@@ -160,6 +160,7 @@ async def lifespan(app: FastAPI):
 
 async def ensure_tables():
     async with pg_pool.acquire() as conn:
+        
         await conn.execute("""
         CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
@@ -364,26 +365,44 @@ class ParseIn(BaseModel):
     file_id: str
     table_label: str
 
+
+class ParseIn(BaseModel):
+    file_id: str
+    table_label: str
+
+
 @app.post("/parse")
 async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
     try:
-        frow = await db.fetchrow("SELECT id, stored_url FROM files WHERE id=$1::uuid", body.file_id)
+        # select id, stored_url, name so we can use file_name later
+        frow = await db.fetchrow(
+            "SELECT id, stored_url, name FROM files WHERE id=$1::uuid",
+            body.file_id,
+        )
         if not frow:
             raise HTTPException(404, "file not found")
+
+        file_id = frow["id"]
+        file_name = frow["name"]
+        stored_url = frow["stored_url"]
 
         trow = await db.fetchrow(
             """INSERT INTO tables (file_id, label, parser_version)
                VALUES ($1,$2,$3) RETURNING id""",
-            frow["id"], body.table_label, "v0.1"
+            file_id,
+            body.table_label,
+            "v0.1",
         )
         table_id = trow["id"]
 
-        tmp = download_file_to_tmp(frow["stored_url"])
+        tmp = download_file_to_tmp(stored_url)
         try:
             rows = parse_pdf_to_rows_combined(tmp)
         finally:
-            try: os.remove(tmp)
-            except: pass
+            try:
+                os.remove(tmp)
+            except:
+                pass
 
         clean_rows = []
 
@@ -401,14 +420,15 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
             if r["amount"] is None:
                 continue
 
-            # store the cleaned title back on the row so everything downstream (diff, render) sees it
+            # keep both original and cleaned
+            r["program_name_raw"] = raw_name
             r["program_name"] = name
             clean_rows.append(r)
 
         rows = clean_rows
 
         for r in rows:
-            raw_program = r.get("program_name") or ""
+            raw_program = r.get("program_name_raw") or r.get("program_name") or ""
             heuristic_name = clean_program_title(raw_program)
 
             # If the cleaned name is not actually a usable program label, skip row
@@ -436,7 +456,8 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
             # Decide whether this looks generic and should be refined by AI
             if needs_ai_refinement(heuristic_name):
                 ai_name_tmp, ai_brief_tmp = await call_ai_for_program(
-                    context=r.get("context") or "",
+                    # use the raw program text as context for now
+                    context=raw_program,
                     amount=r.get("amount"),
                     fy=r.get("fy"),
                     file_label=file_name,
@@ -500,9 +521,9 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
 
     except HTTPException:
         raise
-    except Exception as e:
-        # print full error in your uvicorn logs so you can see the stack
-        import traceback; traceback.print_exc()
+    except Exception:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail="parse failed")
 
 @app.get("/tables/{table_id}/audit")

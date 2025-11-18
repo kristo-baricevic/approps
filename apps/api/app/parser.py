@@ -12,6 +12,7 @@ NUM_CURRENCY_RE = re.compile(r"\(?\$\s*[\d,]+(?:\.\d{1,2})?\)?")
 UNIT_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*(billion|million)\b", re.I)
 NUM_RE = re.compile(r"\(?\$?\s*[\d,]+(?:\.\d{1,2})?\)?")
 FY_RE  = re.compile(r"\bFY\s*([12]\d{3})\b", re.I)
+OPENAI_MODEL_PROGRAMS = os.getenv("OPENAI_MODEL_PROGRAMS", "gpt-4.1-mini")
 
 AMT_RE = re.compile(
     r"""
@@ -131,6 +132,78 @@ JUNK_PROGRAM_RE = re.compile(
     """,
     re.I | re.X,
 )
+
+def build_program_prompt(raw_snippet: str, context: Optional[str], amount: Optional[int]) -> str:
+    amount_str = f"${amount:,}" if amount is not None else "an unspecified dollar amount"
+    ctx = (context or "").strip()
+    return textwrap.dedent(
+        f"""
+        You are helping label line items from a U.S. congressional appropriations explanatory statement.
+
+        Task:
+        1. Identify the specific program or activity that this dollar amount is funding.
+        2. Return:
+           - a short human friendly program name
+           - a one sentence plain language brief that explains what the program does.
+
+        Requirements:
+        - Do not include dollar values in the name.
+        - Do not reference sections, page numbers, or citations.
+        - If there is no clear program or the text is too vague, return "UNKNOWN" for the name and a blank brief.
+
+        Dollar amount: {amount_str}
+
+        Raw snippet:
+        {raw_snippet}
+
+        Surrounding context:
+        {ctx}
+        """
+    ).strip()
+
+async def ai_label_program(
+    raw_snippet: str,
+    context: Optional[str],
+    amount: Optional[int],
+) -> tuple[str, str]:
+    prompt = build_program_prompt(raw_snippet, context, amount)
+
+    resp = await asyncio.to_thread(
+        openai.ChatCompletion.create,
+        model=OPENAI_MODEL_PROGRAMS,
+        messages=[
+            {"role": "system", "content": "You label budget line items from U.S. appropriations bills."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.2,
+        max_tokens=128,
+    )
+
+    text = resp["choices"][0]["message"]["content"].strip()
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+
+    if not lines:
+        return "UNKNOWN", ""
+
+    if len(lines) == 1:
+        name = lines[0]
+        brief = ""
+    else:
+        name = lines[0]
+        brief = " ".join(lines[1:])
+
+    if ":" in name:
+        name = name.split(":", 1)[-1].strip()
+    if name.upper().startswith("PROGRAM NAME"):
+        name = name.split(":", 1)[-1].strip() or name
+    if brief.upper().startswith("BRIEF"):
+        brief = brief.split(":", 1)[-1].strip() or brief
+
+    name = name.strip() or "UNKNOWN"
+    brief = brief.strip()
+
+    return name, brief
+
 
 def looks_like_program_name(program: str) -> bool:
     if not program:
