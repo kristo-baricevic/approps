@@ -150,7 +150,6 @@ SUBALLOCATION_PREFIXES = [
     "these funds",
 ]
 
-
 def parse_bbox_string(bbox_str: str):
     if not bbox_str:
         return None
@@ -317,32 +316,24 @@ def to_whole_dollars(num_str: str, unit: Optional[str], had_dollar_prefix: bool)
     return int(round(x * mult))
 
 def extract_program_phrase(line: str) -> str:
-    """
-    Grab a concise 'what' phrase after a funding verb up to a comma/that-clause.
-    """
     s = line.strip()
-    # common leads
     verbs = [
         r"providing\b", r"provide\b", r"provides\b", r"maintaining\b", r"maintains\b",
         r"increasing\b", r"increases\b", r"decreasing\b", r"decreases\b",
         r"reducing\b", r"reduces\b", r"eliminating\b", r"eliminates\b",
-        r"a total discretionary allocation of\b", r"total discretionary allocation of\b"
+        r"a total discretionary allocation of\b", r"total discretionary allocation of\b",
     ]
     m = re.search(r"(?:" + "|".join(verbs) + r")(.+)", s, flags=re.I)
     if m:
         frag = m.group(1)
     else:
-        # fallback: after amount
         m2 = re.search(AMT_RE, s)
         frag = s[m2.end():] if m2 else s
 
-    # trim at strong stopper
-    frag = re.split(r"[.;]|—|–", frag, maxsplit=1)[0]
-    # strip leading preps/stop-words
-    frag = re.sub(r"^\s*(for|to|of|in|by|at|on|toward|towards|which|that|the)\s+", "", frag, flags=re.I)
-    frag = re.sub(r"\s+", " ", frag).strip()
-    # keep it readable but short
-    return frag[:160]
+    frag = re.sub(r"^\s*(for|to)\s+", "", frag, flags=re.I)
+    frag = re.split(r"[.;]", frag, 1)[0]
+    frag = frag.strip(" ,.;:-")
+    return frag
 
 def extract_tables_with_camelot(local_path: str, page_number: int) -> List[List[List[str]]]:
     """
@@ -542,21 +533,32 @@ def is_likely_appropriation_line(line: str) -> bool:
     if not (NUM_CURRENCY_RE.search(s) or UNIT_RE.search(s)):
         return False
 
-    s = re.sub(r"^\s*\d+\s+", "", s)
-    s = re.sub(r"^\s*\d+\.\s+", "", s)
+    lower = s.lower()
+    if "this act may be cited as" in lower:
+        return False
+    if "table of contents" in lower:
+        return False
 
-    if re.search(r"\bFor\b", s, flags=re.I):
-        return True
-    if re.search(r"\bnecessary expenses\b", s, flags=re.I):
-        return True
-    if re.search(r"\bappropriat(?:ed|ion|ions)\b", s, flags=re.I):
-        return True
-    if re.search(r"\bto remain available until\b", s, flags=re.I):
-        return True
-    if re.search(r"\bgrants to\b", s, flags=re.I):
-        return True
+    return True
 
-    return False
+def looks_like_heading(line: str) -> bool:
+    s = (line or "").strip()
+    if len(s) < 4 or len(s) > 160:
+        return False
+
+    if NUM_CURRENCY_RE.search(s) or UNIT_RE.search(s):
+        return False
+    if re.search(r"\d", s):
+        return False
+
+    s_no_trail = s.rstrip(" .;:")
+    words = re.findall(r"[A-Za-z][A-Za-z'-]*", s_no_trail)
+    if not words:
+        return False
+    if len(words) == 1 and len(words[0]) < 6:
+        return False
+
+    return True
 
 
 def parse_pdf_prose_amounts(local_path: str) -> List[Dict[str, Any]]:
@@ -568,9 +570,18 @@ def parse_pdf_prose_amounts(local_path: str) -> List[Dict[str, Any]]:
                 continue
 
             parts = re.split(r"(?:\n|\r|\u2022|\u2023|•|◦|o\s)", text)
+            prev_heading: str | None = None
+
             for raw in parts:
                 line = (raw or "").strip()
                 if len(line) < 6:
+                    continue
+
+                has_amount = bool(NUM_CURRENCY_RE.search(line) or UNIT_RE.search(line))
+
+                if not has_amount:
+                    if looks_like_heading(line):
+                        prev_heading = line
                     continue
 
                 if not is_likely_appropriation_line(line):
@@ -592,7 +603,11 @@ def parse_pdf_prose_amounts(local_path: str) -> List[Dict[str, Any]]:
                 if NEG_CUES.search(line):
                     amt = -abs(amt)
 
-                prog = extract_program_phrase(line)
+                if prev_heading:
+                    prog = prev_heading.strip().rstrip(".")
+                else:
+                    prog = extract_program_phrase(line)
+
                 if len(re.findall(r"[A-Za-z]{2,}", prog)) < 2:
                     if "total discretionary allocation" not in prog.lower():
                         continue
@@ -600,14 +615,22 @@ def parse_pdf_prose_amounts(local_path: str) -> List[Dict[str, Any]]:
                 amount_text = m.group(0)
                 bbox = find_amount_bbox(page, amount_text)
 
-                out.append({
-                    "program_name": prog,
-                    "amount": amt,
-                    "page": pidx,
-                    "bbox": bbox,
-                    "fy": None,
-                    "context": line,
-                })
+                context_parts: List[str] = []
+                if prev_heading:
+                    context_parts.append(prev_heading.strip())
+                context_parts.append(line)
+                context = " ".join(context_parts)
+
+                out.append(
+                    {
+                        "program_name": prog,
+                        "amount": amt,
+                        "page": pidx,
+                        "bbox": bbox,
+                        "fy": None,
+                        "context": context,
+                    }
+                )
 
     return out
 
@@ -660,8 +683,29 @@ def clean_program_title(text: str) -> str:
 
     return frag.lower()
 
+from typing import Any, Dict, List, Tuple
+
+GENERIC_NAMES = {"unknown activity", "unknown program"}
+
+def _parse_bbox_for_row(bbox_str: str | None) -> Tuple[float, float, float, float] | None:
+    if not bbox_str:
+        return None
+    try:
+        nums = [float(x) for x in bbox_str.strip("[]").split(",")]
+        if len(nums) != 4:
+            return None
+        return nums[0], nums[1], nums[2], nums[3]
+    except Exception:
+        return None
+
+def _is_generic_name(name: str | None) -> bool:
+    if not name:
+        return True
+    return name.strip().lower() in GENERIC_NAMES
+
 def postprocess_rows(rows: list[dict]) -> list[dict]:
-    enriched: list[dict] = []
+    # Step 1. Normalize bbox and compute sort key
+    enriched = []
     for idx, row in enumerate(rows):
         bbox_vals = parse_bbox_string(row.get("bbox") or "")
         if bbox_vals:
@@ -670,29 +714,93 @@ def postprocess_rows(rows: list[dict]) -> list[dict]:
             left, top = 0.0, 0.0
 
         r = dict(row)
+        r["_norm_bbox"] = bbox_vals
         r["_sort_key"] = (r.get("page") or 0, top, left, idx)
         enriched.append(r)
 
+    # Step 2. Group by page + normalized bbox only
     groups: dict[tuple, dict] = {}
     for r in enriched:
-        bbox_raw = r.get("bbox")
-
-        # Fix: normalize bbox so it can be hashed
-        if isinstance(bbox_raw, list):
-            bbox_key = tuple(bbox_raw)
-        else:
-            bbox_key = bbox_raw
-
-        key = (r.get("page"), bbox_key, r.get("amount"))
-
+        key = (r.get("page"), tuple(r["_norm_bbox"]) if r["_norm_bbox"] else None)
         if key not in groups:
-            groups[key] = {"rows": [], "sort_key": r["_sort_key"]}
-
+            groups[key] = {
+                "rows": [],
+                "best_sort": r["_sort_key"],
+            }
         groups[key]["rows"].append(r)
+        if r["_sort_key"] < groups[key]["best_sort"]:
+            groups[key]["best_sort"] = r["_sort_key"]
 
-        if r["_sort_key"] < groups[key]["sort_key"]:
-            groups[key]["sort_key"] = r["_sort_key"]
+    # Step 3. Merge each group into a single canonical row
+    merged: list[dict] = []
+    for key, g in groups.items():
+        rows_here = g["rows"]
+        base = dict(rows_here[0])
 
+        # Choose best program name
+        best_name = base.get("program_name")
+        best_raw = base.get("program_name_raw")
+        best_source = base.get("program_name_source")
+
+        for r in rows_here[1:]:
+            name = r.get("program_name")
+            source = r.get("program_name_source")
+            raw = r.get("program_name_raw")
+
+            # Prefer non-generic heuristic names
+            if source == "heuristic" and name and "unknown" not in name.lower():
+                best_name = name
+                best_raw = raw
+                best_source = source
+                continue
+
+            # Prefer good AI names ONLY if heuristic is missing or garbage
+            if source == "ai" and name:
+                if not best_name or "unknown" in best_name.lower():
+                    best_name = name
+                    best_raw = raw
+                    best_source = source
+
+        base["program_name"] = best_name
+        base["program_name_raw"] = best_raw
+        base["program_name_source"] = best_source
+
+        # Choose amount: prefer largest real amount
+        best_amount = base.get("amount") or 0
+        for r in rows_here[1:]:
+            amt = r.get("amount") or 0
+            if amt > best_amount:
+                best_amount = amt
+        base["amount"] = best_amount
+
+        # Suballocation detection
+        raw_text = (best_raw or "").lower()
+        if any(
+            p in raw_text
+            for p in [
+                "within the total",
+                "of which",
+                "no less than",
+            ]
+        ):
+            base["is_suballocation"] = True
+        else:
+            base["is_suballocation"] = False
+
+        # Use the best sort key
+        base["_sort_key"] = g["best_sort"]
+
+        merged.append(base)
+
+    # Step 4. Sort by reading order
+    merged.sort(key=lambda r: r["_sort_key"])
+
+    # Step 5. Remove internal fields
+    for r in merged:
+        r.pop("_sort_key", None)
+        r.pop("_norm_bbox", None)
+
+    return merged
 
     def choose_canonical(candidates: list[dict]) -> dict:
         good_ai = [

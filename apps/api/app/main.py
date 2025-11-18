@@ -505,12 +505,17 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
             if needs_ai_refinement(heuristic_name):
                 print(f"needs_ai_refinement ---- 001 ")
 
+                context_for_ai = (r.get("context") or "").strip()
+                if not context_for_ai:
+                    context_for_ai = heuristic_name
+
                 ai_name_tmp, ai_brief_tmp = await call_ai_for_program(
-                    context=heuristic_name,
+                    context=context_for_ai,
                     amount=r.get("amount"),
                     fy=r.get("fy"),
                     file_label=file_name,
                 )
+
                 if ai_name_tmp:
                     final_name = ai_name_tmp
                     ai_name = ai_name_tmp
