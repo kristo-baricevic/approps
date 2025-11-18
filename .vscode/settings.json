@@ -28,6 +28,7 @@
     "pydantic",
     "reportlab",
     "SAMHSA",
+    "suballocation",
     "tailwindcss",
     "TANF",
     "TIMESTAMPTZ",

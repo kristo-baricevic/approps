@@ -133,6 +133,59 @@ JUNK_PROGRAM_RE = re.compile(
     re.I | re.X,
 )
 
+SUBALLOCATION_PREFIXES = [
+    "within the total",
+    "within the amount",
+    "within the funds",
+    "within the amount provided",
+    "of the funds provided",
+    "of this amount",
+    "of which",
+    "the agreement includes",
+    "agreement includes",
+    "the agreement continues",
+    "the agreement provides",
+    "this activity",
+    "this program",
+    "these funds",
+]
+
+
+def parse_bbox_string(bbox_str: str):
+    if not bbox_str:
+        return None
+    try:
+        parts = [float(p.strip()) for p in bbox_str.strip("[]").split(",")]
+        if len(parts) != 4:
+            return None
+        return parts
+    except Exception:
+        return None
+
+
+def is_suballocation_text(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower().strip()
+    for p in SUBALLOCATION_PREFIXES:
+        if t.startswith(p):
+            return True
+    if t.startswith("within the"):
+        return True
+    return False
+
+
+def is_total_text(text: str) -> bool:
+    if not text:
+        return False
+    t = text.lower().strip()
+    if t.startswith("total "):
+        return True
+    if "total appropriation" in t or "total appropriations" in t:
+        return True
+    return False
+
+
 def build_program_prompt(raw_snippet: str, context: Optional[str], amount: Optional[int]) -> str:
     amount_str = f"${amount:,}" if amount is not None else "an unspecified dollar amount"
     ctx = (context or "").strip()
@@ -558,17 +611,13 @@ def parse_pdf_prose_amounts(local_path: str) -> List[Dict[str, Any]]:
 
     return out
 
-def parse_pdf_to_rows_combined(local_path: str) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    try:
-        rows.extend(parse_pdf_to_rows(local_path))
-    except Exception:
-        pass
-    try:
-        rows.extend(parse_pdf_prose_amounts(local_path))
-    except Exception:
-        pass
-    return rows
+def parse_pdf_to_rows_combined(local_path: str) -> list[dict]:
+    table_rows = parse_pdf_to_rows(local_path)
+    prose_rows = parse_pdf_prose_amounts(local_path)
+    all_rows = table_rows + prose_rows
+    all_rows = postprocess_rows(all_rows)
+    return all_rows
+
 
 def download_file_to_tmp(stored_url: str) -> str:
     bucket, key = s3_url_to_bucket_key(stored_url)
@@ -610,3 +659,104 @@ def clean_program_title(text: str) -> str:
     frag = frag.strip(" ,.;:-")
 
     return frag.lower()
+
+def postprocess_rows(rows: list[dict]) -> list[dict]:
+    enriched: list[dict] = []
+    for idx, row in enumerate(rows):
+        bbox_vals = parse_bbox_string(row.get("bbox") or "")
+        if bbox_vals:
+            left, top, right, bottom = bbox_vals
+        else:
+            left, top = 0.0, 0.0
+
+        r = dict(row)
+        r["_sort_key"] = (r.get("page") or 0, top, left, idx)
+        enriched.append(r)
+
+    groups: dict[tuple, dict] = {}
+    for r in enriched:
+        bbox_raw = r.get("bbox")
+
+        # Fix: normalize bbox so it can be hashed
+        if isinstance(bbox_raw, list):
+            bbox_key = tuple(bbox_raw)
+        else:
+            bbox_key = bbox_raw
+
+        key = (r.get("page"), bbox_key, r.get("amount"))
+
+        if key not in groups:
+            groups[key] = {"rows": [], "sort_key": r["_sort_key"]}
+
+        groups[key]["rows"].append(r)
+
+        if r["_sort_key"] < groups[key]["sort_key"]:
+            groups[key]["sort_key"] = r["_sort_key"]
+
+
+    def choose_canonical(candidates: list[dict]) -> dict:
+        good_ai = [
+            r
+            for r in candidates
+            if r.get("program_ai_name")
+            and not str(r.get("program_ai_name")).lower().startswith("unknown")
+        ]
+        if good_ai:
+            base = dict(
+                sorted(
+                    good_ai,
+                    key=lambda r: len(str(r.get("program_ai_name") or "")),
+                )[-1]
+            )
+            base["program_name"] = base.get("program_ai_name")
+            base["program_name_source"] = "ai"
+            return base
+
+        heur = [r for r in candidates if r.get("program_name_source") == "heuristic"]
+        if heur:
+            base = dict(
+                sorted(
+                    heur,
+                    key=lambda r: len(str(r.get("program_name") or "")),
+                )[-1]
+            )
+            return base
+
+        return dict(candidates[0])
+
+    ordered_groups = sorted(groups.values(), key=lambda g: g["sort_key"])
+    final_rows: list[dict] = []
+    for g in ordered_groups:
+        chosen = choose_canonical(g["rows"])
+        final_rows.append(chosen)
+
+    current_parent_idx: int | None = None
+    for idx, row in enumerate(final_rows):
+        raw = row.get("program_name_raw") or ""
+        name = row.get("program_name") or ""
+        combined = " ".join(
+            x for x in [row.get("program_name"), row.get("program_ai_name"), raw] if x
+        )
+
+        row["is_suballocation"] = is_suballocation_text(raw)
+        row["is_total"] = is_total_text(combined)
+
+        if row["is_suballocation"]:
+            if current_parent_idx is not None:
+                row["parent_row_id"] = final_rows[current_parent_idx].get("row_id")
+        else:
+            current_parent_idx = idx
+
+        row["display_order"] = idx
+
+    parent_ids = {
+        r["parent_row_id"] for r in final_rows if r.get("parent_row_id") is not None
+    }
+    for r in final_rows:
+        r["has_suballocations"] = r.get("row_id") in parent_ids
+
+    for r in final_rows:
+        if "_sort_key" in r:
+            del r["_sort_key"]
+
+    return final_rows

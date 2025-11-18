@@ -5,6 +5,7 @@ import { useParams, useRouter } from "next/navigation";
 import Link from "next/link";
 
 type TableRow = {
+  row_id: number;
   program_name: string;
   program_ai_name: string;
   program_ai_brief: string;
@@ -32,6 +33,9 @@ export default function TablePage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [reparseLoading, setReparseLoading] = useState(false);
+  const [renderUrl, setRenderUrl] = useState<string | null>(null);
+  const [renderingRowId, setRenderingRowId] = useState<string | null>(null);
+  const [renderLoading, setRenderLoading] = useState(false);
 
   const apiBase = process.env.NEXT_PUBLIC_API_URL;
 
@@ -107,6 +111,33 @@ export default function TablePage() {
     }
   };
 
+  async function viewSource(row: TableRow) {
+    if (!row.row_id) return;
+    try {
+      setRenderLoading(true);
+      setRenderingRowId(String(row.row_id));
+      setRenderUrl(null);
+
+      const r = await fetch(`${apiBase}/render`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ row_id: row.row_id }),
+      });
+
+      if (!r.ok) {
+        const msg = await r.text();
+        throw new Error(msg || "render failed");
+      }
+
+      const data = await r.json();
+      setRenderUrl(data.url);
+    } catch (e) {
+      console.error("viewSource failed", e);
+    } finally {
+      setRenderLoading(false);
+    }
+  }
+
   return (
     <main className="p-6 space-y-4">
       <header className="flex items-center justify-between">
@@ -174,6 +205,7 @@ export default function TablePage() {
                       <th className="px-3 py-2 text-right">Amount ($)</th>
                       <th className="px-3 py-2 text-left">FY</th>
                       <th className="px-3 py-2 text-left">Page</th>
+                      <th className="px-3 py-2 text-left">Source</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -203,6 +235,14 @@ export default function TablePage() {
                         <td className="px-3 py-2 text-xs text-slate-300">
                           {row.page}
                         </td>
+                        <td className="p-2 text-center">
+                          <button
+                            className="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 cursor-pointer"
+                            onClick={() => viewSource(row)}
+                          >
+                            View source
+                          </button>
+                        </td>
                       </tr>
                     ))}
                   </tbody>
@@ -211,6 +251,36 @@ export default function TablePage() {
             )}
           </section>
         </>
+      )}
+      {renderingRowId && (
+        <div className="fixed inset-0 bg-black/70 flex items-center justify-center z-50">
+          <div className="bg-slate-900 border-2 border-slate-300 rounded-lg p-4 max-w-3xl w-full max-h-[90vh] flex flex-col">
+            <div className="flex justify-between items-center mb-2">
+              <h2 className="text-sm font-semibold">Source highlight</h2>
+              <button
+                className="text-xs px-2 py-1 rounded bg-slate-700 hover:bg-slate-600 cursor-pointer"
+                onClick={() => {
+                  setRenderingRowId(null);
+                  setRenderUrl(null);
+                }}
+              >
+                Close
+              </button>
+            </div>
+            {renderLoading && (
+              <p className="text-slate-300 text-xs mb-2">Rendering…</p>
+            )}
+            {renderUrl && (
+              <div className="flex-1 overflow-auto">
+                <img
+                  src={renderUrl}
+                  alt="highlighted source cell"
+                  className="max-w-full h-auto mx-auto"
+                />
+              </div>
+            )}
+          </div>
+        </div>
       )}
     </main>
   );
