@@ -6,6 +6,8 @@ import Link from "next/link";
 
 type TableRow = {
   program_name: string;
+  program_ai_name: string;
+  program_ai_brief: string;
   amount: number | null;
   page: number;
   fy: number | null;
@@ -180,7 +182,18 @@ export default function TablePage() {
                         key={`${row.program_name}-${row.page}-${idx}`}
                         className="border-t border-slate-800 hover:bg-slate-800/40"
                       >
-                        <td className="px-3 py-2">{row.program_name}</td>
+                        <td className="px-3 py-2">
+                          <div className="flex flex-col">
+                            <div className="flex">
+                              {row.program_ai_name
+                                ? row.program_ai_name
+                                : row.program_name}
+                            </div>
+                            <div className="flex text-gray-500">
+                              {row.program_ai_brief}
+                            </div>
+                          </div>
+                        </td>
                         <td className="px-3 py-2 text-right font-mono">
                           {formatAmount(row.amount)}
                         </td>
