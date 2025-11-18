@@ -14,6 +14,7 @@
     "httpx",
     "jobcorps",
     "LIHEAP",
+    "minio",
     "minioadmin",
     "mult",
     "ossp",

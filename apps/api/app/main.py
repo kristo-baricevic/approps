@@ -17,6 +17,7 @@ import io, csv
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 from botocore.exceptions import ClientError
+from openai import AsyncOpenAI
 
 load_dotenv()
 
@@ -25,6 +26,83 @@ assert DB_DSN, "Missing DATABASE_URL"
 
 pg_pool: asyncpg.pool.Pool | None = None
 print("LOADED:", __file__)
+
+AI_ENABLED = bool(os.getenv("OPENAI_API_KEY"))
+_ai_client = AsyncOpenAI() if AI_ENABLED else None
+
+GENERIC_PROGRAM_RE = re.compile(
+    r"""
+    ^agreement\b|
+    ^includes?\b|
+    ^this\b|
+    ^within\b|
+    ^which\b|
+    ^no\s+less\s+than\b|
+    ^increase\s+of\b|
+    ^ending\b|
+    ^support\s+a\b|
+    total\ discretionary\ allocation
+    """,
+    re.I | re.X,
+)
+
+
+def needs_ai_refinement(name: str) -> bool:
+    if not name:
+        return False
+    s = name.strip().lower()
+    if len(s.split()) <= 2:
+        return True
+    if GENERIC_PROGRAM_RE.search(s):
+        return True
+    return False
+
+
+async def call_ai_for_program(
+    context: str,
+    amount: int | None,
+    fy: int | None,
+    file_label: str,
+) -> tuple[str, str]:
+    if not AI_ENABLED or not context:
+        return "", ""
+
+    system_msg = (
+        "You are helping label budget line items from US appropriations explanatory statements. "
+        "Given a short excerpt, identify the specific program or activity being funded and write "
+        "a short human readable description. Keep the name concise and the description brief."
+    )
+
+    user_msg = f"""
+Bill label: {file_label}
+Amount: {amount if amount is not None else "UNKNOWN"}
+Fiscal year: {fy if fy is not None else "UNKNOWN"}
+
+Context:
+{context}
+
+Return JSON with keys "name" and "brief". Example:
+{{"name": "Behavioral Health Workforce Education and Training", "brief": "Funds training programs that expand the mental and behavioral health workforce."}}
+"""
+
+    try:
+        resp = await _ai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user", "content": user_msg},
+            ],
+            temperature=0.1,
+            max_tokens=200,
+        )
+        content = resp.choices[0].message.content or ""
+        data = json.loads(content)
+        name = (data.get("name") or "").strip()
+        brief = (data.get("brief") or "").strip()
+        return name, brief
+    except Exception:
+        return "", ""
+
 
 def normalize_bbox(raw: Any) -> Optional[List[float]]:
     if raw is None:
@@ -106,16 +184,28 @@ async def ensure_tables():
         );
 
         CREATE TABLE IF NOT EXISTS rows (
-          id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-          table_id UUID NOT NULL REFERENCES tables(id) ON DELETE CASCADE,
-          program_id TEXT,
-          program_name TEXT,
-          fy INT,
-          amount BIGINT,
-          bbox JSONB,
-          page INT,
-          checksum TEXT
+            id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+            table_id UUID NOT NULL REFERENCES tables(id) ON DELETE CASCADE,
+
+            program_id TEXT,
+            program_name TEXT,          -- final label that UI uses
+            program_name_raw TEXT,      -- raw heuristic text from parser
+            program_ai_name TEXT,       -- AI suggested cleaner name
+            program_ai_brief TEXT,      -- AI short description
+            program_name_source TEXT,   -- 'heuristic' or 'ai'
+
+            fy INT,
+            amount BIGINT,
+            bbox JSONB,
+            page INT,
+            checksum TEXT
         );
+
+
+        ALTER TABLE rows ADD COLUMN IF NOT EXISTS program_name_raw TEXT;
+        ALTER TABLE rows ADD COLUMN IF NOT EXISTS program_ai_name TEXT;
+        ALTER TABLE rows ADD COLUMN IF NOT EXISTS program_ai_brief TEXT;
+        ALTER TABLE rows ADD COLUMN IF NOT EXISTS program_name_source TEXT;
 
         CREATE TABLE IF NOT EXISTS audits (
           id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -142,8 +232,6 @@ async def ensure_tables():
           delta_pct DOUBLE PRECISION
         );
 
-
-        -- One-time cleanup is safe to keep; it’s a no-op when already clean.
         WITH d AS (
           SELECT ctid,
                  ROW_NUMBER() OVER (PARTITION BY table_id, checksum ORDER BY ctid) AS rn
@@ -320,42 +408,82 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
         rows = clean_rows
 
         for r in rows:
-            name = r["program_name"]  # already cleaned
-            program_id = get_program_id(name)
+            raw_program = r.get("program_name") or ""
+            heuristic_name = clean_program_title(raw_program)
 
-            checksum = md5_row(name, r["fy"], r["amount"], r["page"])
-            bbox_val = r.get("bbox")
-            bbox_json = json.dumps(bbox_val) if bbox_val else None
+            # If the cleaned name is not actually a usable program label, skip row
+            if not looks_like_program_name(heuristic_name):
+                continue
 
-            await db.execute(
-                """INSERT INTO rows (table_id, program_id, program_name, fy, amount, bbox, page, checksum)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-                ON CONFLICT (table_id, checksum) DO NOTHING""",
-                table_id,
-                program_id,
-                name,
+            program_id = get_program_id(heuristic_name)
+
+            checksum = md5_row(
+                heuristic_name,
                 r["fy"],
                 r["amount"],
-                bbox_json,
                 r["page"],
-                checksum,
             )
 
-        for r in rows:
-            name = r["program_name"]
-            program_id = get_program_id(name)
-
-            checksum = md5_row(name, r["fy"], r["amount"], r["page"])
             bbox_val = r.get("bbox")
             bbox_json = json.dumps(bbox_val) if bbox_val else None
 
+            # Default metadata (no AI)
+            final_name = heuristic_name
+            ai_name: str | None = None
+            ai_brief: str | None = None
+            name_source = "heuristic"
+
+            # Decide whether this looks generic and should be refined by AI
+            if needs_ai_refinement(heuristic_name):
+                ai_name_tmp, ai_brief_tmp = await call_ai_for_program(
+                    context=r.get("context") or "",
+                    amount=r.get("amount"),
+                    fy=r.get("fy"),
+                    file_label=file_name,
+                )
+                if ai_name_tmp:
+                    final_name = ai_name_tmp
+                    ai_name = ai_name_tmp
+                    ai_brief = ai_brief_tmp or None
+                    name_source = "ai"
+
             await db.execute(
-                """INSERT INTO rows (table_id, program_id, program_name, fy, amount, bbox, page, checksum)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8)
-                ON CONFLICT (table_id, checksum) DO NOTHING""",
+                """
+                INSERT INTO rows (
+                    table_id,
+                    program_id,
+                    program_name,
+                    program_name_raw,
+                    program_ai_name,
+                    program_ai_brief,
+                    program_name_source,
+                    fy,
+                    amount,
+                    bbox,
+                    page,
+                    checksum
+                )
+                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                ON CONFLICT (table_id, checksum) DO UPDATE
+                SET
+                    program_id = EXCLUDED.program_id,
+                    program_name = EXCLUDED.program_name,
+                    program_name_raw = EXCLUDED.program_name_raw,
+                    program_ai_name = EXCLUDED.program_ai_name,
+                    program_ai_brief = EXCLUDED.program_ai_brief,
+                    program_name_source = EXCLUDED.program_name_source,
+                    fy = EXCLUDED.fy,
+                    amount = EXCLUDED.amount,
+                    bbox = EXCLUDED.bbox,
+                    page = EXCLUDED.page
+                """,
                 table_id,
                 program_id,
-                name,
+                final_name,                   # program_name (final)
+                raw_program or None,          # program_name_raw
+                ai_name,                      # program_ai_name
+                ai_brief,                     # program_ai_brief
+                name_source,                  # program_name_source
                 r["fy"],
                 r["amount"],
                 bbox_json,

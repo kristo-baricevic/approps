@@ -132,7 +132,6 @@ JUNK_PROGRAM_RE = re.compile(
     re.I | re.X,
 )
 
-
 def looks_like_program_name(program: str) -> bool:
     if not program:
         return False
@@ -151,7 +150,6 @@ def looks_like_program_name(program: str) -> bool:
         return False
 
     return True
-
 
 def normalize_program_name_for_id(name: str) -> str:
     if not name:
@@ -392,13 +390,17 @@ def parse_pdf_to_rows(local_path: str) -> list[dict]:
                     amount_text = m_amt.group(0) if m_amt else amount_cell
                     bbox = find_amount_bbox(page, amount_text) or None
 
+                    context_line = " ".join([c for c in row if c]).strip()
+
                     out.append({
                         "program_name": program,
                         "amount": amt,
                         "page": pidx,
                         "bbox": bbox,
                         "fy": fy,
+                        "context": context_line,
                     })
+
     return out
 
 import re
@@ -478,7 +480,9 @@ def parse_pdf_prose_amounts(local_path: str) -> List[Dict[str, Any]]:
                     "page": pidx,
                     "bbox": bbox,
                     "fy": None,
+                    "context": line,
                 })
+
     return out
 
 def parse_pdf_to_rows_combined(local_path: str) -> List[Dict[str, Any]]:
