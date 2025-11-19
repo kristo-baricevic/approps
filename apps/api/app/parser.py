@@ -324,6 +324,13 @@ def to_whole_dollars(num_str: str, unit: Optional[str], had_dollar_prefix: bool)
 
 def extract_program_phrase(line: str) -> str:
     s = line.strip()
+
+    if re.search(r"\.{5,}", s):
+        before_dots = re.split(r"\.{3,}", s)[0]
+        before_dots = before_dots.strip(" ,.;:-")
+        if before_dots:
+            return before_dots
+
     verbs = [
         r"providing\b", r"provide\b", r"provides\b", r"maintaining\b", r"maintains\b",
         r"increasing\b", r"increases\b", r"decreasing\b", r"decreases\b",
@@ -335,12 +342,17 @@ def extract_program_phrase(line: str) -> str:
         frag = m.group(1)
     else:
         m2 = re.search(AMT_RE, s)
-        frag = s[m2.end():] if m2 else s
+        if m2:
+            frag = s[m2.end():]
+        else:
+            frag = s
 
     frag = re.sub(r"^\s*(for|to)\s+", "", frag, flags=re.I)
     frag = re.split(r"[.;]", frag, 1)[0]
     frag = frag.strip(" ,.;:-")
     return frag
+
+
 
 def extract_tables_with_camelot(local_path: str, page_number: int) -> List[List[List[str]]]:
     """
@@ -608,8 +620,9 @@ def parse_pdf_prose_amounts(local_path: str) -> list[dict]:
 
                 prog_from_line = extract_program_phrase(line)
 
-                # always prefer the heading when present
-                if heading and not is_suballocation_text(line):
+                is_dotted_line = bool(re.search(r"\.{5,}", line))
+
+                if heading and not is_suballocation_text(line) and not is_dotted_line:
                     prog = heading
                 else:
                     prog = prog_from_line
