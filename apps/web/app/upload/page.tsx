@@ -53,30 +53,26 @@ async function uploadDirect(presigned: any, file: File) {
     console.log("- OK:", r.ok);
     console.log("- Headers:", Object.fromEntries(r.headers.entries()));
 
-    // MinIO returns 200 for successful PUT
     if (r.status === 200) {
       console.log("✅ Upload successful!");
       return;
     }
 
-    // Try to get response body
     const responseText = await r
       .text()
       .catch((e) => `Failed to read response: ${e}`);
     console.log("Response body:", responseText);
 
-    // Only throw if not 2xx
     if (!r.ok) {
       throw new Error(`Upload failed: ${r.status} ${r.statusText}`);
     }
-  } catch (error) {
+  } catch (error: any) {
     console.error("Upload error details:", {
       name: error.name,
       message: error.message,
       stack: error.stack,
     });
 
-    // Check if it's a network error
     if (error instanceof TypeError && error.message === "Failed to fetch") {
       console.error("Network error - this could be:");
       console.error("1. CORS (but we verified this works)");
@@ -139,57 +135,75 @@ export default function UploadPage() {
   }
 
   async function go() {
-    if (!a || !b) return;
+    if (!a && !b) return;
+
     try {
-      const last = await handle(a);
-      const curr = await handle(b);
+      setStatus("Uploading and processing...");
+      setError(null);
 
-      // parse both
-      const lastParse = await parseFile(last.file_id, "Labor-HHS-Education");
-      const currParse = await parseFile(curr.file_id, "Labor-HHS-Education");
+      if (a && b) {
+        const last = await handle(a);
+        const curr = await handle(b);
 
-      console.log("lastParse", lastParse);
-      console.log("currParse", currParse);
+        const lastParse = await parseFile(last.file_id, "Labor-HHS-Education");
+        const currParse = await parseFile(curr.file_id, "Labor-HHS-Education");
 
-      if (!currParse.audit || currParse.audit.passed !== true) {
-        setResult({ last, curr, lastParse, currParse });
+        console.log("lastParse", lastParse);
+        console.log("currParse", currParse);
+
+        if (!currParse.audit || currParse.audit.passed !== true) {
+          setResult({ last, curr, lastParse, currParse });
+          setStatus(null);
+          setError("We could not reliably process the current document.");
+          return;
+        }
+
+        const currPreview = await fetch(
+          `${API}/tables/${currParse.table_id}/preview`
+        ).then((r) => r.json());
+
+        const lastPreview = await fetch(
+          `${API}/tables/${lastParse.table_id}/preview`
+        ).then((r) => r.json());
+
+        const diffRes = await fetch(`${API}/diff`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            prev_table_id: lastParse.table_id,
+            curr_table_id: currParse.table_id,
+          }),
+        }).then((r) => r.json());
+
+        setResult({
+          last,
+          curr,
+          lastParse,
+          currParse,
+          lastPreview,
+          currPreview,
+          diffId: diffRes.diff_id,
+        });
         setStatus(null);
-        setError("We could not reliably process the current document.");
-        return;
+        router.push(`/diff/${diffRes.diff_id}`);
+      } else {
+        const file = (b ?? a)!;
+        const reg = await handle(file);
+        const parseRes = await parseFile(reg.file_id, "Labor-HHS-Education");
+
+        console.log("singleParse", parseRes);
+
+        if (!parseRes.table_id) {
+          setStatus(null);
+          setError("Could not determine table for this document.");
+          return;
+        }
+
+        setResult({ single: reg, parse: parseRes });
+        setStatus(null);
+        router.push(`/tables/${parseRes.table_id}`);
       }
-
-      // preview rows for the current file (and last if you want)
-      const currPreview = await fetch(
-        `${API}/tables/${currParse.table_id}/preview`
-      ).then((r) => r.json());
-
-      const lastPreview = await fetch(
-        `${API}/tables/${lastParse.table_id}/preview`
-      ).then((r) => r.json());
-
-      const diffRes = await fetch(`${API}/diff`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          prev_table_id: lastParse.table_id,
-          curr_table_id: currParse.table_id,
-        }),
-      }).then((r) => r.json());
-
-      // optional: still keep previews in `result` if you like
-      setResult({
-        last,
-        curr,
-        lastParse,
-        currParse,
-        lastPreview,
-        currPreview,
-        diffId: diffRes.diff_id,
-      });
-      setStatus(null);
-      // send user straight to the Diff view
-      router.push(`/diff/${diffRes.diff_id}`);
-    } catch (e) {
+    } catch (e: any) {
       console.error(e);
       setStatus(null);
       setError(
@@ -204,7 +218,7 @@ export default function UploadPage() {
 
   return (
     <div className="max-w-xl mx-auto p-6 space-y-4">
-      <h1 className="text-xl font-semibold">Upload two PDFs</h1>
+      <h1 className="text-xl font-semibold">Upload one or two PDFs</h1>
       <div className="flex flex-col">
         Last
         <input
@@ -258,6 +272,8 @@ export default function UploadPage() {
           </tbody>
         </table>
       )}
+      {status && <div className="text-sm text-slate-300">{status}</div>}
+      {error && <div className="text-sm text-red-400">{error}</div>}
     </div>
   );
 }
