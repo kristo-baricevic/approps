@@ -724,12 +724,14 @@ def postprocess_rows(rows: list[dict]) -> list[dict]:
         amt = row.get("amount") or 0
         ctx = (row.get("context") or row.get("program_name_raw") or "").lower()
 
-        if amt < 1_000 and (
-            "p.l." in ctx
-            or "u.s.c." in ctx
-            or "section " in ctx
-        ):
+        cite_hit = "p.l." in ctx or "u.s.c." in ctx or "section " in ctx
+
+        if amt < 1_000 and cite_hit:
             print(f"[postprocess] drop cite row amount={amt} ctx={ctx[:120]}")
+            continue
+
+        if cite_hit and amt < 1_000_000:
+            print(f"[postprocess] drop usc/p.l. row amount={amt} ctx={ctx[:120]}")
             continue
 
         if amt < 1_000 and "days" in ctx and ("enactment" in ctx or "briefing" in ctx):
