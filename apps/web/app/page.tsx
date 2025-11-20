@@ -62,6 +62,8 @@ export default function Page() {
   );
   const [sortKey, setSortKey] = useState<SortKey>(null);
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
+  const [confirmOpen, setConfirmOpen] = useState(false);
+  const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
 
   const router = useRouter();
 
@@ -319,7 +321,10 @@ export default function Page() {
                         </button>
                         <button
                           type="button"
-                          onClick={() => handleDelete(f.table_id)}
+                          onClick={() => {
+                            setPendingDeleteId(f.table_id);
+                            setConfirmOpen(true);
+                          }}
                           className="inline-block rounded-lg border border-red-700 px-2 py-1 text-xs hover:bg-red-200 hover:text-slate-900 cursor-pointer"
                         >
                           Delete
@@ -330,6 +335,38 @@ export default function Page() {
                 })}
               </tbody>
             </table>
+            {confirmOpen && (
+              <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+                <div className="bg-slate-900 border border-slate-700 p-6 rounded-xl w-72 text-sm">
+                  <p className="mb-4 text-slate-200">Delete this table?</p>
+
+                  <div className="flex justify-end space-x-3">
+                    <button
+                      className="px-3 py-1 rounded border border-slate-700 hover:bg-slate-700 cursor-pointer"
+                      onClick={() => {
+                        setConfirmOpen(false);
+                        setPendingDeleteId(null);
+                      }}
+                    >
+                      Cancel
+                    </button>
+
+                    <button
+                      className="px-3 py-1 rounded border border-red-700 text-red-300 hover:bg-red-700 hover:text-white cursor-pointer"
+                      onClick={async () => {
+                        if (pendingDeleteId) {
+                          await handleDelete(pendingDeleteId);
+                        }
+                        setConfirmOpen(false);
+                        setPendingDeleteId(null);
+                      }}
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         )}
       </section>
