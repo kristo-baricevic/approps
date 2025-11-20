@@ -415,7 +415,7 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
     print("calling parse: begin")
 
     try:
-        # 1) Load file, either by explicit id or by filename in table_label
+        # 1. Find the file row
         if body.file_id:
             frow = await db.fetchrow(
                 "SELECT id, name, stored_url FROM files WHERE id = $1::uuid",
@@ -432,25 +432,53 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
             raise HTTPException(404, "file not found")
 
         file_id = frow["id"]
-        file_name = frow["name"]      # used as context for AI
+        file_name = frow["name"]
         stored_url = frow["stored_url"]
-
         table_label = body.table_label or file_name
 
-        # 2) Create a new table record
-        trow = await db.fetchrow(
+        # ------------------------------------------------------
+        # 2. Check for existing table for this file + label
+        # ------------------------------------------------------
+        existing = await db.fetchrow(
             """
-            INSERT INTO tables (file_id, label, parser_version)
-            VALUES ($1, $2, $3)
-            RETURNING id
+            SELECT id FROM tables
+            WHERE file_id = $1 AND label = $2
+            ORDER BY created_at DESC
+            LIMIT 1
             """,
             file_id,
             table_label,
-            "v0.1",
         )
-        table_id = trow["id"]
 
-        # 3) Download and parse PDF
+        if existing:
+            # REPARSE: reuse same table_id
+            table_id = existing["id"]
+            print("Reparse detected. Reusing table:", table_id)
+
+            # wipe old rows
+            await db.execute(
+                "DELETE FROM rows WHERE table_id = $1",
+                table_id,
+            )
+
+        else:
+            # FIRST PARSE: create new table
+            trow = await db.fetchrow(
+                """
+                INSERT INTO tables (file_id, label, parser_version)
+                VALUES ($1, $2, $3)
+                RETURNING id
+                """,
+                file_id,
+                table_label,
+                "v0.1",
+            )
+            table_id = trow["id"]
+            print("New parse. Created table:", table_id)
+
+        # ------------------------------------------------------
+        # 3. Parse the PDF
+        # ------------------------------------------------------
         tmp = download_file_to_tmp(stored_url)
         try:
             rows = await parse_pdf_to_rows_with_ai(tmp)
@@ -459,12 +487,13 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
                 os.remove(tmp)
             except:
                 pass
+
         print("Download and parse PDF complete")
 
-
-        # 4) Initial cleaning of raw rows
+        # ------------------------------------------------------
+        # 4. Clean rows
+        # ------------------------------------------------------
         clean_rows = []
-
         for r in rows:
             raw_name = r.get("program_name") or ""
             name = clean_program_title(raw_name)
@@ -472,29 +501,25 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
             if len(name) < 4:
                 continue
 
-            # must contain at least 2 alphabetic tokens (avoid “a total d”, “o”, “•”, “period”)
             if len([t for t in re.findall(r"[A-Za-z]+", name) if len(t) >= 2]) < 2:
                 continue
 
             if r.get("amount") is None:
                 continue
 
-            # store the cleaned title back on the row so everything downstream sees it
             r["program_name"] = name
             clean_rows.append(r)
 
         rows = clean_rows
 
-        # 5) Insert rows with optional AI refinement
+        # ------------------------------------------------------
+        # 5. Insert rows (same as before)
+        # ------------------------------------------------------
         for r in rows:
             raw_program = r.get("program_name") or ""
             heuristic_name = clean_program_title(raw_program)
-            print(f"heuristic_name is -====- {heuristic_name}")
 
-            # If you want to keep an extra guard here, define a simple helper,
-            # or just trust the cleaning above. For now, trust it.
-            # if not looks_like_program_name(heuristic_name):
-            #     continue
+            print(f"heuristic_name is -====- {heuristic_name}")
 
             program_id = get_program_id(heuristic_name)
 
@@ -508,22 +533,17 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
             bbox_val = r.get("bbox")
             bbox_json = json.dumps(bbox_val) if bbox_val is not None else None
 
-            # Default metadata (no AI)
             final_name = heuristic_name
             ai_name: str | None = None
             ai_brief: str | None = None
             name_source = "heuristic"
+
             print(f"needs_ai_refinement ---- 000 ")
 
-            # 5a) Decide whether to send to AI
             if needs_ai_refinement(heuristic_name):
                 print(f"needs_ai_refinement ---- 001 ")
 
                 context_for_ai = r.get("program_name_raw") or heuristic_name
-
-                if not context_for_ai:
-                    context_for_ai = r.get("program_name_raw") or heuristic_name
-
                 ai_name_tmp, ai_brief_tmp = await call_ai_for_program(
                     context=context_for_ai,
                     amount=r.get("amount"),
@@ -537,7 +557,6 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
                     ai_brief = ai_brief_tmp or None
                     name_source = "ai"
 
-            # 5b) Insert (or update) row
             await db.execute(
                 """
                 INSERT INTO rows (
@@ -555,18 +574,6 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
                     checksum
                 )
                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
-                ON CONFLICT (table_id, checksum) DO UPDATE
-                SET
-                    program_id = EXCLUDED.program_id,
-                    program_name = EXCLUDED.program_name,
-                    program_name_raw = EXCLUDED.program_name_raw,
-                    program_ai_name = EXCLUDED.program_ai_name,
-                    program_ai_brief = EXCLUDED.program_ai_brief,
-                    program_name_source = EXCLUDED.program_name_source,
-                    fy = EXCLUDED.fy,
-                    amount = EXCLUDED.amount,
-                    bbox = EXCLUDED.bbox,
-                    page = EXCLUDED.page
                 """,
                 table_id,
                 program_id,
@@ -581,9 +588,11 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
                 r.get("page"),
                 checksum,
             )
+
         print(f"needs_ai_refinement ---- 003 ")
 
         audit = await audit_table(str(table_id), db)
+
         return {
             "table_id": str(table_id),
             "audit": audit,
