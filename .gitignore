@@ -17,3 +17,4 @@ __pycache__/
 .vscode/
 readme-internal.txt
 apps/api/.minio-data/
+*.minio.sys/
