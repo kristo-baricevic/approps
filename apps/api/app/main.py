@@ -410,12 +410,17 @@ class ParseIn(BaseModel):
     table_label: str
 
 
+class ParseIn(BaseModel):
+    file_id: str | None = None
+    table_label: str
+
+
 @app.post("/parse")
 async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
     print("calling parse: begin")
 
     try:
-        # 1. Find the file row
+        # 1) Load file, either by explicit id or by filename in table_label
         if body.file_id:
             frow = await db.fetchrow(
                 "SELECT id, name, stored_url FROM files WHERE id = $1::uuid",
@@ -432,17 +437,17 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
             raise HTTPException(404, "file not found")
 
         file_id = frow["id"]
-        file_name = frow["name"]
+        file_name = frow["name"]      # used as context for AI in the parser module
         stored_url = frow["stored_url"]
+
         table_label = body.table_label or file_name
 
-        # ------------------------------------------------------
-        # 2. Check for existing table for this file + label
-        # ------------------------------------------------------
+        # 2) Find or create table record for this file + label
         existing = await db.fetchrow(
             """
-            SELECT id FROM tables
-            WHERE file_id = $1 AND label = $2
+            SELECT id
+            FROM tables
+            WHERE file_id = $1::uuid AND label = $2
             ORDER BY created_at DESC
             LIMIT 1
             """,
@@ -451,18 +456,14 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
         )
 
         if existing:
-            # REPARSE: reuse same table_id
             table_id = existing["id"]
-            print("Reparse detected. Reusing table:", table_id)
-
-            # wipe old rows
+            print(f"Reparse detected. Reusing table: {table_id}")
+            # Clear old rows so result matches current parse exactly
             await db.execute(
-                "DELETE FROM rows WHERE table_id = $1",
+                "DELETE FROM rows WHERE table_id = $1::uuid",
                 table_id,
             )
-
         else:
-            # FIRST PARSE: create new table
             trow = await db.fetchrow(
                 """
                 INSERT INTO tables (file_id, label, parser_version)
@@ -474,52 +475,48 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
                 "v0.1",
             )
             table_id = trow["id"]
-            print("New parse. Created table:", table_id)
 
-        # ------------------------------------------------------
-        # 3. Parse the PDF
-        # ------------------------------------------------------
+        # 3) Download and parse PDF using the parser module
         tmp = download_file_to_tmp(stored_url)
         try:
+            # This already calls parse_pdf_to_rows_combined + fill_missing_program_briefs
             rows = await parse_pdf_to_rows_with_ai(tmp)
         finally:
             try:
                 os.remove(tmp)
             except:
                 pass
-
         print("Download and parse PDF complete")
 
-        # ------------------------------------------------------
-        # 4. Clean rows
-        # ------------------------------------------------------
-        clean_rows = []
+        # 4) Initial cleaning of raw rows
+        clean_rows: list[dict] = []
+
         for r in rows:
-            raw_name = r.get("program_name") or ""
+            # parser usually sets program_name and program_name_raw
+            raw_name = r.get("program_name") or r.get("program_name_raw") or ""
             name = clean_program_title(raw_name)
 
+            # basic filters so we do not store trash rows
             if len(name) < 4:
                 continue
 
+            # must contain at least 2 alphabetic tokens of length >= 2
             if len([t for t in re.findall(r"[A-Za-z]+", name) if len(t) >= 2]) < 2:
                 continue
 
             if r.get("amount") is None:
                 continue
 
+            # store the cleaned title back on the row
             r["program_name"] = name
             clean_rows.append(r)
 
         rows = clean_rows
 
-        # ------------------------------------------------------
-        # 5. Insert rows (same as before)
-        # ------------------------------------------------------
+        # 5) Insert rows using parser AI metadata if present
         for r in rows:
-            raw_program = r.get("program_name") or ""
-            heuristic_name = clean_program_title(raw_program)
-
-            print(f"heuristic_name is -====- {heuristic_name}")
+            base_name = r.get("program_name") or ""
+            heuristic_name = clean_program_title(base_name)
 
             program_id = get_program_id(heuristic_name)
 
@@ -533,29 +530,19 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
             bbox_val = r.get("bbox")
             bbox_json = json.dumps(bbox_val) if bbox_val is not None else None
 
-            final_name = heuristic_name
-            ai_name: str | None = None
-            ai_brief: str | None = None
-            name_source = "heuristic"
+            # Use AI label from the parser if available, but do not run a second AI layer here
+            ai_name = (r.get("program_ai_name") or "").strip() or None
+            ai_brief = (r.get("program_ai_brief") or "").strip() or None
 
-            print(f"needs_ai_refinement ---- 000 ")
+            final_name = ai_name or heuristic_name
+            name_source = "ai" if ai_name else "heuristic"
 
-            if needs_ai_refinement(heuristic_name):
-                print(f"needs_ai_refinement ---- 001 ")
-
-                context_for_ai = r.get("program_name_raw") or heuristic_name
-                ai_name_tmp, ai_brief_tmp = await call_ai_for_program(
-                    context=context_for_ai,
-                    amount=r.get("amount"),
-                    fy=r.get("fy"),
-                    file_label=file_name,
-                )
-
-                if ai_name_tmp:
-                    final_name = ai_name_tmp
-                    ai_name = ai_name_tmp
-                    ai_brief = ai_brief_tmp or None
-                    name_source = "ai"
+            raw_program = (
+                r.get("program_name_raw")
+                or r.get("program_name")
+                or base_name
+                or None
+            )
 
             await db.execute(
                 """
@@ -574,11 +561,23 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
                     checksum
                 )
                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+                ON CONFLICT (table_id, checksum) DO UPDATE
+                SET
+                    program_id = EXCLUDED.program_id,
+                    program_name = EXCLUDED.program_name,
+                    program_name_raw = EXCLUDED.program_name_raw,
+                    program_ai_name = EXCLUDED.program_ai_name,
+                    program_ai_brief = EXCLUDED.program_ai_brief,
+                    program_name_source = EXCLUDED.program_name_source,
+                    fy = EXCLUDED.fy,
+                    amount = EXCLUDED.amount,
+                    bbox = EXCLUDED.bbox,
+                    page = EXCLUDED.page
                 """,
                 table_id,
                 program_id,
                 final_name,
-                raw_program or None,
+                raw_program,
                 ai_name,
                 ai_brief,
                 name_source,
@@ -589,10 +588,7 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
                 checksum,
             )
 
-        print(f"needs_ai_refinement ---- 003 ")
-
         audit = await audit_table(str(table_id), db)
-
         return {
             "table_id": str(table_id),
             "audit": audit,
@@ -605,6 +601,7 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="parse failed")
+
 
 @app.get("/tables/{table_id}/audit")
 async def get_audit(table_id: str, db=Depends(get_db)):
@@ -783,67 +780,14 @@ async def render_cell(body: RenderIn, db=Depends(get_db)):
     if not raw_bbox:
         raise HTTPException(status_code=400, detail="no bbox stored for this row")
 
-    # --------- normalize bbox into [x0, top, x1, bottom] ---------
-    bbox = None
+    # --------- normalize bbox using your existing helper ---------
+    bbox = normalize_bbox(raw_bbox)
 
-    # Case 1: already list/tuple/array-like
-    if isinstance(raw_bbox, (list, tuple)):
-        try:
-            bbox = [float(v) if not isinstance(v, Decimal) else float(v) for v in raw_bbox]
-        except (TypeError, ValueError):
-            bbox = None
-
-    # Case 2: dict with keys
-    elif isinstance(raw_bbox, dict):
-        try:
-            bbox = [
-                float(raw_bbox["x0"]),
-                float(raw_bbox["top"]),
-                float(raw_bbox["x1"]),
-                float(raw_bbox["bottom"]),
-            ]
-        except (KeyError, TypeError, ValueError):
-            bbox = None
-
-    # Case 3: string from DB (json or comma-separated or "(..,..,..,..)")
-    elif isinstance(raw_bbox, str):
-        s = raw_bbox.strip()
-        if s:
-            # try JSON first
-            try:
-                parsed = json.loads(s)
-            except json.JSONDecodeError:
-                # fallback: strip parentheses and split on commas
-                s2 = s.replace("(", "").replace(")", "")
-                parts = [p.strip() for p in s2.split(",")]
-                if len(parts) == 4:
-                    try:
-                        bbox = [float(p) for p in parts]
-                    except ValueError:
-                        bbox = None
-            else:
-                # json was ok
-                if isinstance(parsed, (list, tuple)):
-                    try:
-                        bbox = [float(v) for v in parsed]
-                    except (TypeError, ValueError):
-                        bbox = None
-                elif isinstance(parsed, dict):
-                    try:
-                        bbox = [
-                            float(parsed["x0"]),
-                            float(parsed["top"]),
-                            float(parsed["x1"]),
-                            float(parsed["bottom"]),
-                        ]
-                    except (KeyError, TypeError, ValueError):
-                        bbox = None
-
-    if not bbox or len(bbox) < 4:
+    if not bbox or len(bbox) != 4:
         print("render ==== normalized bbox is invalid:", bbox)
         raise HTTPException(status_code=400, detail="invalid bbox format for this row")
 
-    x0, top, x1, bottom = bbox[:4]
+    x0, top, x1, bottom = bbox
     # --------- end bbox normalization ---------
 
     page_num = row["page"] or 1
@@ -884,6 +828,7 @@ async def render_cell(body: RenderIn, db=Depends(get_db)):
     )
 
     return {"url": url}
+
 
 @app.get("/export/csv")
 async def export_csv(diff_id: str, db=Depends(get_db)):

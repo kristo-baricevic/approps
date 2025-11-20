@@ -310,15 +310,17 @@ def build_program_prompt(raw_snippet: str, context: Optional[str], amount: Optio
         You are helping label line items from a U.S. congressional appropriations explanatory statement.
 
         Task:
-        1. Identify the specific program or activity that this dollar amount is funding.
+        1. Identify the specific program or activity funded by this dollar amount.
         2. Return:
            - a short human friendly program name
-           - a one sentence plain language brief that explains what the program does.
+           - one sentence explaining what the program does in plain language
 
         Requirements:
+        - The explanation sentence must not begin with any label such as 'Brief:', 'Summary:', or similar.
+        - Do not add any prefixes of any kind.
         - Do not include dollar values in the name.
         - Do not reference sections, page numbers, or citations.
-        - If there is no clear program or the text is too vague, return "UNKNOWN" for the name and a blank brief.
+        - If the program cannot be determined, return "UNKNOWN" as the name and an empty explanation.
 
         Dollar amount: {amount_str}
 
@@ -589,88 +591,146 @@ def find_amount_bbox(page: pdfplumber.page.Page, amount_text: str) -> Optional[L
     return None
 
 def parse_pdf_to_rows(local_path: str) -> list[dict]:
-    out: list[dict] = []
+    import pdfplumber
+    import re
+
+    rows: list[dict] = []
+
+    AMOUNT_RE = re.compile(r"\$?\s?(\d[\d,]{2,})\b")
+
+    def extract_amount(text: str) -> int | None:
+        m = AMOUNT_RE.findall(text)
+        if not m:
+            return None
+        try:
+            return int(m[-1].replace(",", ""))
+        except:
+            return None
+
+    def line_center(y0, y1):
+        return (y0 + y1) / 2
+
     with pdfplumber.open(local_path) as pdf:
-        for pidx, page in enumerate(pdf.pages, start=1):
-            settings_candidates = [
-                {"vertical_strategy": "lines", "horizontal_strategy": "lines", "snap_tolerance": 3},
-                {"vertical_strategy": "text",  "horizontal_strategy": "text",  "text_x_tolerance": 2, "text_y_tolerance": 2},
-            ]
-            tables = []
-            for ts in settings_candidates:
-                try:
-                    t = page.extract_tables(table_settings=ts) or []
-                except Exception:
-                    t = []
-                if t:
-                    tables = t
-                    break
 
-            if not tables:
-                camelot_tables = extract_tables_with_camelot(local_path, pidx)
-                tables = camelot_tables
+        for page_index, page in enumerate(pdf.pages, start=1):
+            word_objects = page.extract_words(
+                keep_blank_chars=False,
+                use_text_flow=True,
+            )
 
-            if not tables:
-                continue
+            # build visual rows
+            visual_rows: list[list[dict]] = []
+            for w in word_objects:
+                cy = line_center(w["top"], w["bottom"])
+                placed = False
+                for vr in visual_rows:
+                    first = vr[0]
+                    cy0 = line_center(first["top"], first["bottom"])
+                    if abs(cy - cy0) <= 3:
+                        vr.append(w)
+                        placed = True
+                        break
+                if not placed:
+                    visual_rows.append([w])
 
-            for tbl in tables:
-                if not tbl or len(tbl) < 2:
-                    continue
+            # sort rows by vertical position
+            visual_rows.sort(key=lambda r: line_center(r[0]["top"], r[0]["bottom"]))
 
-                headers = [norm_header(c or "") for c in tbl[0]]
-                fy = detect_fy_from_headers(headers)
+            # rebuild lines with x ordering
+            processed = []
+            for vr in visual_rows:
+                vr.sort(key=lambda w: w["x0"])
+                text = " ".join(w["text"] for w in vr)
+                x0 = min(w["x0"] for w in vr)
+                top = min(w["top"] for w in vr)
+                x1 = max(w["x1"] for w in vr)
+                bottom = max(w["bottom"] for w in vr)
 
-                for row in tbl[1:]:
-                    if not row:
-                        continue
+                # compute indent level relative to left margin
+                indent = int(x0 // 20)
 
-                    program = (row[0] or "").strip()
+                processed.append(
+                    {
+                        "text": text.strip(),
+                        "x0": x0,
+                        "x1": x1,
+                        "top": top,
+                        "bottom": bottom,
+                        "indent": indent,
+                    }
+                )
 
-                    if not looks_like_program_name(program):
-                        continue
+            # collapse hierarchy blocks
+            blocks = []
+            current_block = None
 
-                    amount_cell = None
-                    for cell in reversed(row):
-                        if not cell:
+            for ln in processed:
+                txt = ln["text"].strip()
+
+                if ln["indent"] == 0:
+                    # starting a new parent block
+                    if current_block:
+                        blocks.append(current_block)
+                    current_block = {
+                        "page": page_index,
+                        "lines": [ln],
+                    }
+                else:
+                    # attach to existing block if exists
+                    if current_block:
+                        t = ln["text"].strip().lower()
+
+                        # NEW skip rule: prevent corrupting the program title
+                        if re.match(r"^(less than|within|provided|the agreement|agreement)", t):
                             continue
-                        s = str(cell)
-                        if NUM_CURRENCY_RE.search(s):
-                            amount_cell = s
-                            break
-                        m = UNIT_RE.search(s)
-                        if m:
-                            amount_cell = s
-                            break
-                    if not amount_cell:
-                        continue
 
-                    amt = clean_amount(amount_cell)
-                    if amt is None:
-                        m = UNIT_RE.search(amount_cell)
-                        if m:
-                            val = float(m.group(1))
-                            unit = m.group(2).lower()
-                            mult = 1_000_000_000 if unit == "billion" else 1_000_000
-                            amt = int(round(val * mult))
-                    if amt is None:
-                        continue
+                        current_block["lines"].append(ln)
 
-                    m_amt = AMT_RE.search(amount_cell)
-                    amount_text = m_amt.group(0) if m_amt else amount_cell
-                    bbox = find_amount_bbox(page, amount_text) or None
+                    else:
+                        # no parent above, treat as parent anyway
+                        current_block = {
+                            "page": page_index,
+                            "lines": [ln],
+                        }
 
-                    context_line = " ".join([c for c in row if c]).strip()
+            if current_block:
+                blocks.append(current_block)
 
-                    out.append({
-                        "program_name": program,
-                        "amount": amt,
-                        "page": pidx,
-                        "bbox": bbox,
-                        "fy": fy,
-                        "context": context_line,
-                    })
+            # finalize blocks into rows
+            for block in blocks:
+                page_num = block["page"]
+                lines = block["lines"]
 
-    return out
+                full_text = " ".join(ln["text"] for ln in lines).strip()
+                amount = extract_amount(full_text)
+
+                # name = all text before the last amount occurrence
+                name_text = full_text
+                if amount is not None:
+                    amt_token = f"{amount:,}"
+                    idx = full_text.rfind(amt_token)
+                    if idx > 0:
+                        name_text = full_text[:idx].strip()
+
+                # block bbox
+                x0 = min(ln["x0"] for ln in lines)
+                top = min(ln["top"] for ln in lines)
+                x1 = max(ln["x1"] for ln in lines)
+                bottom = max(ln["bottom"] for ln in lines)
+
+                rows.append(
+                    {
+                        "program_name": name_text,
+                        "program_name_raw": name_text,
+                        "page": page_num,
+                        "amount": amount,
+                        "bbox": [float(x0), float(top), float(x1), float(bottom)],
+                        "fy": None,
+                    }
+                )
+
+    return rows
+
 
 import re
 NUM_CURRENCY_RE = re.compile(r"\(?\$\s*[\d,]+(?:\.\d{1,2})?\)?")
@@ -683,9 +743,21 @@ def is_likely_appropriation_line(line: str) -> bool:
     if not s:
         return False
 
+    # NEW: reject boilerplate continuation lines that are not program titles
+    low_signal_prefixes = (
+        "agreement provides",
+        "the agreement provides",
+        "provided",
+        "within",
+        "the agreement continues",
+        "continues",
+        "agreement includes",
+    )
+    if s.lower().startswith(low_signal_prefixes):
+        return False
+
     # Accept any line that clearly mentions a dollar or X million/billion.
     return bool(NUM_CURRENCY_RE.search(s) or UNIT_RE.search(s))
-
 
 
 def looks_like_heading(line: str) -> bool:
@@ -796,9 +868,53 @@ def parse_pdf_prose_amounts(local_path: str) -> list[dict]:
 
 
 def parse_pdf_to_rows_combined(local_path: str) -> list[dict]:
-    table_rows = parse_pdf_to_rows(local_path)
-    prose_rows = parse_pdf_prose_amounts(local_path)
-    all_rows = table_rows + prose_rows
+    """
+    Structured rows first.
+    Then prose rows, but only on pages where structured rows are missing or weak.
+    """
+    structured = parse_pdf_to_rows(local_path)
+
+    # Group structured rows by page
+    structured_by_page: dict[int, list[dict]] = {}
+    for r in structured:
+        p = r.get("page")
+        if not p:
+            continue
+        structured_by_page.setdefault(p, []).append(r)
+
+    prose = parse_pdf_prose_amounts(local_path)
+
+    filtered_prose: list[dict] = []
+
+    for pr in prose:
+        p = pr.get("page")
+        if not p:
+            continue
+
+        page_structured = structured_by_page.get(p, [])
+
+        # Per-page quality check
+        has_good_structured = False
+        if page_structured:
+            # good criteria: ≥2 structured rows with normal-length titles
+            good_titles = [
+                r for r in page_structured
+                if isinstance(r.get("program_name"), str)
+                and len(r["program_name"].split()) >= 2
+                and r.get("amount") is not None
+            ]
+            if len(good_titles) >= 2:
+                has_good_structured = True
+
+        # If structured rows are good, SKIP prose rows for this page
+        if has_good_structured:
+            continue
+
+        # Otherwise, keep prose rows as fallback
+        filtered_prose.append(pr)
+
+    # Combine and postprocess
+    all_rows = structured + filtered_prose
     all_rows = postprocess_rows(all_rows)
     return all_rows
 
