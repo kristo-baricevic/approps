@@ -118,6 +118,20 @@ export default function Page() {
     }
   }
 
+  async function handleDelete(tableId: string) {
+    if (!API) return;
+
+    const res = await fetch(`${API}/delete/${tableId}`, {
+      method: "DELETE",
+    });
+
+    if (res.ok) {
+      setDocs(docs.filter((d) => d.table_id !== tableId));
+    } else {
+      console.error("delete failed", await res.text());
+    }
+  }
+
   const sortedDocs = useMemo(() => {
     if (!sortKey) return docs;
 
@@ -302,6 +316,13 @@ export default function Page() {
                           disabled={!f.table_id}
                         >
                           {isSelected ? "Selected…" : "Compare"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleDelete(f.table_id)}
+                          className="inline-block rounded-lg border border-red-700 px-2 py-1 text-xs hover:bg-red-200 hover:text-slate-900 cursor-pointer"
+                        >
+                          Delete
                         </button>
                       </td>
                     </tr>

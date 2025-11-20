@@ -1019,6 +1019,7 @@ async def list_latest_tables(limit: int = 20, db=Depends(get_db)):
         """
         SELECT
           t.id   AS table_id,
+          f.id   AS file_id,
           f.name AS file_name,
           t.label AS table_label,
           t.created_at,
@@ -1051,6 +1052,7 @@ async def list_latest_tables(limit: int = 20, db=Depends(get_db)):
 
         visible.append({
             "table_id": str(r["table_id"]),
+            "file_id": str(r["file_id"]),
             "file_name": r["file_name"],
             "table_label": r["table_label"],
             "created_at": r["created_at"].isoformat(),
@@ -1121,6 +1123,60 @@ async def get_table(table_id: str, db=Depends(get_db)):
             for r in rows
         ],
     }
+
+class DeleteIn(BaseModel):
+    file_id: str
+
+@app.delete("/delete/{table_id}")
+async def delete_single_table(table_id: str, db=Depends(get_db)):
+
+    # Does this table exist?
+    trow = await db.fetchrow(
+        "SELECT id FROM tables WHERE id = $1::uuid",
+        table_id,
+    )
+    if not trow:
+        raise HTTPException(404, "table not found")
+
+    # Delete the table — rows cascade automatically
+    await db.execute(
+        "DELETE FROM tables WHERE id = $1::uuid",
+        table_id,
+    )
+
+    return {"deleted": True, "table_id": table_id}
+
+
+# @app.delete("/delete")
+# async def delete_endpoint(body: DeleteIn, db=Depends(get_db)):
+#     file_id = body.file_id
+
+#     # fetch all file entries (there should be one, but you said there may be duplicates)
+#     files = await db.fetch(
+#         "SELECT id, stored_url FROM files WHERE id = $1::uuid",
+#         file_id,
+#     )
+#     if not files:
+#         raise HTTPException(404, "file not found")
+
+#     # There may be multiple rows that reference the same stored_url
+#     # We only need to delete the MinIO object once.
+#     stored_url = files[0]["stored_url"]
+
+#     # attempt MinIO delete (ignore all failures)
+#     try:
+#         bucket, key = s3_url_to_bucket_key(stored_url)
+#         s3.delete_object(Bucket=bucket, Key=key)
+#     except Exception as e:
+#         print("MinIO delete failed or object missing:", repr(e))
+
+#     # delete all Postgres records for this file (cascade cleans tables+rows)
+#     await db.execute(
+#         "DELETE FROM files WHERE id = $1::uuid",
+#         file_id,
+#     )
+
+#     return {"deleted": True, "file_id": file_id}
 
 @app.get("/health")
 def health():
