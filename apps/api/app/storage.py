@@ -2,8 +2,8 @@ import os, boto3
 from botocore.client import Config
 from botocore.exceptions import ClientError
 
-# ENDPOINT = os.getenv("S3_ENDPOINT_URL", "http://minio:9000")
-ENDPOINT = os.getenv("S3_ENDPOINT_URL", "http://127.0.0.1:9000")
+ENDPOINT = os.getenv("S3_ENDPOINT_URL", "http://minio:9000")
+# ENDPOINT = os.getenv("S3_ENDPOINT_URL", "http://127.0.0.1:9000")
 REGION   = os.getenv("S3_REGION", "us-east-1")
 BUCKET   = os.getenv("S3_BUCKET", "uploads")
 AK       = os.getenv("S3_ACCESS_KEY", "minioadmin")
