@@ -7,6 +7,17 @@ from botocore.exceptions import ClientError
 from fastapi import HTTPException
 import camelot
 import re
+import textwrap
+from openai import OpenAI
+import os
+
+def get_openai_client():
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY missing in environment when creating OpenAI client")
+    return OpenAI(api_key=api_key)
+
+
 
 NUM_CURRENCY_RE = re.compile(
     r"\$\s*\d{1,3}(?:,\d{3})*(?:\.\d+)?|\d+\s*(?:million|billion|thousand)\b",
@@ -157,6 +168,105 @@ SUBALLOCATION_PREFIXES = [
     "these funds",
 ]
 
+import asyncio
+
+async def fill_missing_program_briefs(rows: list[dict]) -> list[dict]:
+    """
+    For every row that has a program name and amount but no program_ai_brief,
+    call ai_label_program and fill in program_ai_name / program_ai_brief.
+
+    Does not overwrite program_name. Your cleaned heuristic title stays as the
+    display name; AI is only used for metadata.
+    """
+    tasks = []
+    indices = []
+
+    for i, row in enumerate(rows):
+        # Skip rows with no money or obviously junk names
+        amount = row.get("amount")
+        name = row.get("program_name") or row.get("program_name_raw")
+        if not amount or not name:
+            continue
+
+        # Already has a brief, nothing to do
+        if row.get("program_ai_brief"):
+            continue
+
+        raw_snippet = row.get("program_name_raw") or row.get("program_name") or ""
+        context = row.get("context") or ""
+
+        tasks.append(ai_label_program(raw_snippet, context, amount))
+        indices.append(i)
+
+    if not tasks:
+        return rows
+
+    results = await asyncio.gather(*tasks)
+
+    for idx, (ai_name, ai_brief) in zip(indices, results):
+        row = rows[idx]
+
+        # Only populate ai fields; do not touch the cleaned program_name
+        if ai_name and not row.get("program_ai_name"):
+            row["program_ai_name"] = ai_name
+        if ai_brief:
+            row["program_ai_brief"] = ai_brief
+
+    return rows
+
+async def parse_pdf_to_rows_with_ai(local_path: str) -> list[dict]:
+    """
+    Full pipeline used by the API:
+    - parse tables and prose
+    - postprocess and merge
+    - fill in missing AI metadata (program_ai_name, program_ai_brief)
+    """
+    rows = parse_pdf_to_rows_combined(local_path)
+    rows = await fill_missing_program_briefs(rows)
+    return rows
+
+
+
+def extract_amounts_from_text(text: str) -> list[int]:
+    """
+    Find all currency amounts in a chunk of text and return them as integers.
+    Uses existing NUM_CURRENCY_RE and NUM_RE.
+    """
+    amounts: list[int] = []
+    if not text:
+        return amounts
+
+    for m in NUM_CURRENCY_RE.finditer(text):
+        token = m.group(0)
+
+        # Pull out the numeric part
+        num_match = NUM_RE.search(token)
+        if not num_match:
+            continue
+
+        num_str = num_match.group(0)
+        # Strip everything that is not a digit or dot
+        num_str = re.sub(r"[^\d.]", "", num_str)
+        if not num_str:
+            continue
+
+        value = float(num_str)
+
+        # If the token has 'million' or 'billion', scale accordingly
+        unit_match = UNIT_RE.search(token)
+        if unit_match:
+            unit_value = float(unit_match.group(1))
+            unit = unit_match.group(2).lower()
+            if unit.startswith("billion"):
+                value = unit_value * 1_000_000_000
+            elif unit.startswith("million"):
+                value = unit_value * 1_000_000
+
+        amounts.append(int(round(value)))
+
+    return amounts
+
+
 def parse_bbox_string(bbox_str: str):
     if not bbox_str:
         return None
@@ -225,10 +335,12 @@ async def ai_label_program(
     context: Optional[str],
     amount: Optional[int],
 ) -> tuple[str, str]:
+
+    client = get_openai_client()
     prompt = build_program_prompt(raw_snippet, context, amount)
 
     resp = await asyncio.to_thread(
-        openai.ChatCompletion.create,
+        client.chat.completions.create,
         model=OPENAI_MODEL_PROGRAMS,
         messages=[
             {"role": "system", "content": "You label budget line items from U.S. appropriations bills."},
@@ -238,28 +350,49 @@ async def ai_label_program(
         max_tokens=128,
     )
 
-    text = resp["choices"][0]["message"]["content"].strip()
+    text = resp.choices[0].message.content.strip()
     lines = [l.strip() for l in text.splitlines() if l.strip()]
 
+    # Extract name and brief
     if not lines:
-        return "UNKNOWN", ""
-
-    if len(lines) == 1:
+        name = "UNKNOWN"
+        brief = ""
+    elif len(lines) == 1:
         name = lines[0]
         brief = ""
     else:
         name = lines[0]
         brief = " ".join(lines[1:])
 
+    # Cleanup
     if ":" in name:
         name = name.split(":", 1)[-1].strip()
     if name.upper().startswith("PROGRAM NAME"):
         name = name.split(":", 1)[-1].strip() or name
-    if brief.upper().startswith("BRIEF"):
-        brief = brief.split(":", 1)[-1].strip() or brief
-
     name = name.strip() or "UNKNOWN"
-    brief = brief.strip()
+
+    # If brief missing, enforce generation
+    if not brief:
+        brief_prompt = textwrap.dedent(
+            f"""
+            Write one plain language sentence describing what the following program does.
+            Program: {name}
+            Do not mention money, citations, or page numbers.
+            """
+        ).strip()
+
+        resp2 = await asyncio.to_thread(
+            client.chat.completions.create,
+            model=OPENAI_MODEL_PROGRAMS,
+            messages=[
+                {"role": "system", "content": "You describe government programs."},
+                {"role": "user", "content": brief_prompt},
+            ],
+            temperature=0.2,
+            max_tokens=64,
+        )
+
+        brief = resp2.choices[0].message.content.strip().splitlines()[0].strip()
 
     return name, brief
 
@@ -688,31 +821,89 @@ def clean_program_title(text: str) -> str:
     s = (text or "").strip()
     print(f"clean_program_title {s}")
 
+    # Drop trailing "the agreement ..." clauses like:
+    # "Delta States ... Grant Program.-The agreement continues ..."
+    parts = re.split(r"\bthe agreement\b", s, 1, flags=re.I)
+    if parts:
+        s = parts[0]
 
-    # strip leading bullets like "(1)", "(A)", "(i)"
+    # Strip leading bullets like "(1)", "(A)", "(i)"
     s = re.sub(r"^\s*[\(\[]\s*[0-9A-Za-z]+\s*[\)\]]\s*", "", s)
 
-    # grab the last "for ..." clause if present
+    # Grab the last "for ..." clause if present (keeps "for X program")
     matches = list(re.finditer(r"\bfor\s+(.+)", s, flags=re.I))
     if matches:
         frag = matches[-1].group(1)
     else:
         frag = s
 
-    # drop leading "the"/"such"
+    # Drop leading "the"/"such"
     frag = re.sub(r"^\s*(the|such)\s+", "", frag, flags=re.I)
 
-    # cut at the first comma to avoid "..., of which ..." etc.
+    # Cut at first comma to avoid "..., of which ..." tails
     frag = frag.split(",", 1)[0]
 
-    # drop trailing junk like "that / which / shall / including"
+    # Drop trailing junk like "that / which / shall / including"
     for pat in [r"\s+that\b", r"\s+which\b", r"\s+who\b", r"\s+shall\b", r"\s+including\b"]:
         frag = re.split(pat, frag, 1, flags=re.I)[0]
 
     frag = frag.strip(" ,.;:-")
     print(f"clean_program_title frag {frag}")
 
-    return frag.lower()
+    # Smart title-casing with acronym handling
+    SMALL = {
+        "and", "or", "for", "in", "of", "the", "a", "an",
+        "to", "on", "at", "by", "with", "from", "into",
+        "over", "per",
+    }
+    ACRONYMS = {
+        "HIV", "AIDS", "SCID", "USAID", "NIH", "CDC", "SAMHSA",
+        "HRSA", "HUD", "WIC", "SNAP", "TANF", "FBI", "DOJ",
+        "HHS", "DOL", "SSA", "VA", "EPA", "USDA", "DOT",
+    }
+
+    tokens = re.split(r"(\s+)", frag)
+    out: list[str] = []
+
+    for i, tok in enumerate(tokens):
+        if not tok:
+            continue
+        if tok.isspace():
+            out.append(tok)
+            continue
+
+        lower = tok.lower()
+
+        # Lowercase "small words" when not first token
+        if i != 0 and lower in SMALL:
+            out.append(lower)
+            continue
+
+        # Acronyms in parentheses, for example "(SCID)"
+        m_paren = re.fullmatch(r"\(([A-Za-z0-9/&-]+)\)", tok)
+        if m_paren and m_paren.group(1).isupper():
+            inner = m_paren.group(1)
+            if inner.upper() in ACRONYMS or len(inner) <= 4:
+                out.append("(" + inner.upper() + ")")
+                continue
+
+        # Standalone acronyms, for example HIV, AIDS, NIH
+        if tok.upper() in ACRONYMS:
+            out.append(tok.upper())
+            continue
+
+        # Short all-caps tokens or ones with digits or slashes
+        if re.fullmatch(r"[A-Z0-9/&-]+", tok):
+            if len(tok) <= 3 or any(c.isdigit() or c in "/&" for c in tok):
+                out.append(tok)
+                continue
+
+        # Default: normal title-case
+        out.append(lower[:1].upper() + lower[1:])
+
+    titled = "".join(out).strip()
+    return titled
+
 
 
 def _parse_bbox_for_row(bbox_str: str | None) -> Tuple[float, float, float, float] | None:
@@ -734,9 +925,23 @@ def _is_generic_name(name: str | None) -> bool:
 def postprocess_rows(rows: list[dict]) -> list[dict]:
     filtered_rows: list[dict] = []
     for row in rows:
-        amt = row.get("amount") or 0
-        ctx = (row.get("context") or row.get("program_name_raw") or "").lower()
+        ctx_raw = (row.get("context") or row.get("program_name_raw") or "")
+        ctx = ctx_raw.lower()
 
+        # Fix lines like "not less than $29,000,000, an increase of $2,000,000"
+        if "not less than" in ctx and "increase of" in ctx:
+            amounts_in_ctx = extract_amounts_from_text(ctx_raw)
+            if amounts_in_ctx:
+                new_amt = max(amounts_in_ctx)
+                old_amt = row.get("amount") or 0
+                if new_amt != old_amt:
+                    print(
+                        f"[postprocess] override not-less-than+increase "
+                        f"amount {old_amt} -> {new_amt}"
+                    )
+                row["amount"] = new_amt
+
+        amt = row.get("amount") or 0
         cite_hit = "p.l." in ctx or "u.s.c." in ctx or "section " in ctx
 
         if amt < 1_000 and cite_hit:
@@ -746,6 +951,9 @@ def postprocess_rows(rows: list[dict]) -> list[dict]:
         if cite_hit and amt < 1_000_000:
             print(f"[postprocess] drop usc/p.l. row amount={amt} ctx={ctx[:120]}")
             continue
+
+        # ... keep the rest of your existing postprocess_rows logic unchanged ...
+
 
         if amt < 1_000 and "days" in ctx and ("enactment" in ctx or "briefing" in ctx):
             print(f"[postprocess] drop days row amount={amt} ctx={ctx[:120]}")
@@ -840,6 +1048,14 @@ def postprocess_rows(rows: list[dict]) -> list[dict]:
         base["program_name"] = best_name
         base["program_name_raw"] = best_raw
         base["program_name_source"] = best_source
+
+        # Normalize the display title so it matches the program name
+        # and has proper capitalization
+        if base.get("program_name"):
+            cleaned = clean_program_title(str(base["program_name"]))
+            if cleaned:
+                base["program_name"] = cleaned
+
 
         best_amount = base.get("amount") or 0
         for r in rows_here[1:]:

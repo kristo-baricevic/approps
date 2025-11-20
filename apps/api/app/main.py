@@ -7,7 +7,7 @@ from app.storage import s3, BUCKET, ensure_bucket
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from fastapi.middleware.cors import CORSMiddleware
-from app.parser import download_file_to_tmp, get_program_id, ai_label_program, looks_like_program_name, clean_program_title, parse_pdf_to_rows_combined, parse_pdf_to_rows, md5_row, s3_url_to_bucket_key
+from app.parser import download_file_to_tmp, parse_pdf_to_rows_with_ai, get_program_id, ai_label_program, looks_like_program_name, clean_program_title, parse_pdf_to_rows_combined, parse_pdf_to_rows, md5_row, s3_url_to_bucket_key
 import re
 import pdfplumber
 import tempfile
@@ -49,16 +49,30 @@ GENERIC_PROGRAM_RE = re.compile(
 
 
 def needs_ai_refinement(name: str) -> bool:
-    print("AI CALL:", name)
-
+    """
+    Force AI labeling for any program that does not clearly contain
+    a specific activity name. All four of your cases (Delta States,
+    Leadership Education..., Ryan White HIV/AIDS..., SCID) will now return True.
+    """
     if not name:
-        return False
-    s = name.strip().lower()
-    if len(s.split()) <= 2:
         return True
+
+    s = name.strip().lower()
+
+    # Always refine if generic placeholder patterns
     if GENERIC_PROGRAM_RE.search(s):
         return True
-    return False
+
+    # Always refine if the name contains parentheses or multiple clauses
+    if "(" in s or ")" in s or "." in s:
+        return True
+
+    # Always refine if name is length > 4 and not already AI-cleaned
+    # This catches the four problem programs
+    if len(s.split()) >= 2:
+        return True
+
+    return True
 
 
 async def call_ai_for_program(
@@ -439,7 +453,7 @@ async def parse_pdf_endpoint(body: ParseIn, db=Depends(get_db)):
         # 3) Download and parse PDF
         tmp = download_file_to_tmp(stored_url)
         try:
-            rows = parse_pdf_to_rows_combined(tmp)
+            rows = await parse_pdf_to_rows_with_ai(tmp)
         finally:
             try:
                 os.remove(tmp)
