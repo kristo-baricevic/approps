@@ -74,8 +74,8 @@ async function uploadDirect(presigned: any, file: File) {
     });
 
     if (error instanceof TypeError && error.message === "Failed to fetch") {
-      console.error("Network error - this could be:");
-      console.error("1. CORS (but we verified this works)");
+      console.error("Network error, possible causes:");
+      console.error("1. CORS");
       console.error("2. Network timeout");
       console.error("3. Connection reset");
       console.error("4. Response parsing issue");
@@ -217,63 +217,123 @@ export default function UploadPage() {
   }, [result]);
 
   return (
-    <div className="max-w-xl mx-auto p-6 space-y-4">
-      <h1 className="text-xl font-semibold">Upload one or two PDFs</h1>
-      <div className="flex flex-col">
-        Last
-        <input
-          type="file"
-          className="bg-slate-500 p-2 rounded-md flex cursor-pointer!"
-          accept="application/pdf"
-          onChange={(e) => setA(e.target.files?.[0] ?? null)}
-        />
-      </div>
-      <div className="flex flex-col">
-        Current
-        <input
-          type="file"
-          className="bg-slate-500 p-2 rounded-md cursor-pointer!"
-          accept="application/pdf"
-          onChange={(e) => setB(e.target.files?.[0] ?? null)}
-        />
-      </div>
-      <button
-        onClick={go}
-        className="relative hover:bg-slate-500 z-10 px-4 py-2 rounded bg-slate-700 text-white pointer-events-auto cursor-pointer! hover:opacity-90"
-      >
-        Upload
-      </button>
-      <div>
+    <main className="min-h-screen bg-slate-950 px-4 py-8">
+      <div className="mx-auto max-w-3xl space-y-6">
+        <header>
+          <h1 className="text-3xl font-semibold tracking-tight bg-linear-to-r from-blue-400 to-slate-300 bg-clip-text text-transparent">
+            Upload appropriations PDFs
+          </h1>
+          <p className="mt-2 text-sm text-slate-400">
+            Upload one bill to parse it, or upload two fiscal years to see a
+            diff.
+          </p>
+        </header>
+
+        <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-6 shadow-md shadow-black/40 space-y-4">
+          <div className="space-y-2">
+            <label className="text-sm font-medium text-slate-200">
+              Primary file
+            </label>
+            <p className="text-xs text-slate-400">
+              This is the version you want to explore or compare against another
+              year.
+            </p>
+            <input
+              type="file"
+              className="block w-full cursor-pointer rounded-lg border border-slate-600 bg-slate-900/70 px-3 py-2 text-sm text-slate-100 file:mr-3 file:rounded-md file:border-0 file:bg-blue-400 file:px-3 file:py-1 file:text-xs file:font-medium file:text-slate-900 hover:border-blue-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+              accept="application/pdf"
+              onChange={(e) => setA(e.target.files?.[0] ?? null)}
+            />
+          </div>
+
+          {a && (
+            <div className="mt-4 space-y-3 border-t border-slate-800 pt-4">
+              <div className="space-y-2">
+                <label className="text-sm font-medium text-slate-200">
+                  Optional previous year
+                </label>
+                <p className="text-xs text-slate-400">
+                  Add last year&apos;s version of this bill to generate a side
+                  by side diff. You can leave this blank to just parse the
+                  primary file.
+                </p>
+                <input
+                  type="file"
+                  className="block w-full cursor-pointer rounded-lg border border-slate-600 bg-slate-900/70 px-3 py-2 text-sm text-slate-100 file:mr-3 file:rounded-md file:border-0 file:bg-blue-400 file:px-3 file:py-1 file:text-xs file:font-medium file:text-slate-900 hover:border-blue-400 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                  accept="application/pdf"
+                  onChange={(e) => setB(e.target.files?.[0] ?? null)}
+                />
+              </div>
+
+              <button
+                onClick={go}
+                className="mt-2 inline-flex items-center rounded-lg bg-blue-500 px-4 py-2 text-sm font-medium text-slate-900 shadow hover:bg-blue-400 focus:outline-none focus:ring-2 focus:ring-blue-500 cursor-pointer"
+              >
+                Upload and process
+              </button>
+            </div>
+          )}
+
+          {status && (
+            <div className="text-xs text-blue-300 bg-blue-500/10 border border-blue-500/40 rounded-md px-3 py-2">
+              {status}
+            </div>
+          )}
+          {error && (
+            <div className="text-xs text-red-300 bg-red-500/10 border border-red-500/40 rounded-md px-3 py-2">
+              {error}
+            </div>
+          )}
+        </div>
+
         {result && (
-          <pre className="bg-slate-800 p-3 text-white rounded text-sm overflow-auto">
-            {JSON.stringify(result, null, 2)}
-          </pre>
+          <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-4 shadow-md shadow-black/30">
+            <h2 className="mb-3 text-sm font-semibold text-slate-200">
+              Debug output
+            </h2>
+            <pre className="bg-slate-950/80 p-3 text-xs text-slate-100 rounded-lg overflow-auto max-h-80">
+              {JSON.stringify(result, null, 2)}
+            </pre>
+          </div>
+        )}
+
+        {result?.currPreview && result.currPreview.length > 0 && (
+          <div className="rounded-2xl border border-slate-800 bg-slate-900/70 p-4 shadow-md shadow-black/30">
+            <h2 className="mb-3 text-sm font-semibold text-slate-200">
+              Current preview
+            </h2>
+            <table className="w-full text-xs border border-slate-800 rounded-lg overflow-hidden">
+              <thead className="bg-slate-800/80 text-slate-100">
+                <tr>
+                  <th className="p-2 text-left">Program</th>
+                  <th className="p-2 text-center">FY</th>
+                  <th className="p-2 text-right">Amount</th>
+                  <th className="p-2 text-center">Page</th>
+                </tr>
+              </thead>
+              <tbody>
+                {result.currPreview.map((r: any, i: number) => (
+                  <tr
+                    key={i}
+                    className="border-t border-slate-800 hover:bg-slate-800/60"
+                  >
+                    <td className="p-2 align-top text-slate-100">
+                      {r.program_name}
+                    </td>
+                    <td className="p-2 text-center text-slate-300">
+                      {r.fy ?? ""}
+                    </td>
+                    <td className="p-2 text-right text-slate-300">
+                      {r.amount}
+                    </td>
+                    <td className="p-2 text-center text-slate-300">{r.page}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
         )}
       </div>
-      {result?.currPreview && result.currPreview.length > 0 && (
-        <table className="w-full text-sm border mt-4">
-          <thead className="bg-slate-600">
-            <tr>
-              <th className="p-2 text-left">Program</th>
-              <th className="p-2">FY</th>
-              <th className="p-2">Amount</th>
-              <th className="p-2">Page</th>
-            </tr>
-          </thead>
-          <tbody>
-            {result.currPreview.map((r: any, i: number) => (
-              <tr key={i} className="border-t">
-                <td className="p-2">{r.program_name}</td>
-                <td className="p-2 text-center">{r.fy ?? ""}</td>
-                <td className="p-2 text-right">{r.amount}</td>
-                <td className="p-2 text-center">{r.page}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      )}
-      {status && <div className="text-sm text-slate-300">{status}</div>}
-      {error && <div className="text-sm text-red-400">{error}</div>}
-    </div>
+    </main>
   );
 }
