@@ -33,6 +33,8 @@ services:
       retries: 20
 
   api:
+    env_file:
+      - ./apps/api/app/.env
     build: ./apps/api
     command: uvicorn app.main:app --host 0.0.0.0 --port 8000
     depends_on:
@@ -51,6 +53,7 @@ services:
       S3_ACCESS_KEY: ${MINIO_ROOT_USER}
       S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
       PORT: 8000
+
     # IMPORTANT: do NOT expose 8000 directly now
     # ports:
     #   - "8000:8000"
