@@ -757,6 +757,15 @@ class RenderIn(BaseModel):
 import json
 from decimal import Decimal
 from fastapi import HTTPException
+from urllib.parse import urlparse, urlunparse
+
+
+def make_public(url: str) -> str:
+    parsed = urlparse(url)
+    return urlunparse(parsed._replace(netloc="api-approps.com"))
+
+return {"url": make_public(url)}
+
 
 @app.post("/render")
 async def render_cell(body: RenderIn, db=Depends(get_db)):
@@ -826,8 +835,9 @@ async def render_cell(body: RenderIn, db=Depends(get_db)):
         Params={"Bucket": BUCKET, "Key": key},
         ExpiresIn=3600,
     )
+    public_url = make_public(url)
 
-    return {"url": url}
+    return {"url": public_url}
 
 
 @app.get("/export/csv")
