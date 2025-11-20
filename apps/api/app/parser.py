@@ -866,7 +866,6 @@ def parse_pdf_prose_amounts(local_path: str) -> list[dict]:
                 out.append(row)
     return out
 
-
 def parse_pdf_to_rows_combined(local_path: str) -> list[dict]:
     """
     Structured rows first.
